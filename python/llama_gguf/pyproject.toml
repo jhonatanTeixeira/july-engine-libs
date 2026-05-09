@@ -15,5 +15,5 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = [".."]
 include = ["llama_gguf*"]
