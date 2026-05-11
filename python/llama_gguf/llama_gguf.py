@@ -695,13 +695,6 @@ class GGUF:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
-
-        # 6. Limpeza de VRAM (CUDA)
-        try:
-            from ..resource_manager import resource_manager
-            resource_manager.clear_memory()
-        except ImportError:
-            pass
             
         logger.info(f"GGUF: Finished unloading {model_name}")
 
