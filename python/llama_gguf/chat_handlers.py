@@ -16,6 +16,17 @@ class Gemma4Handler(Gemma4ChatHandler):
         # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
         messages = kwargs.get("messages", [])
         for message in messages:
+            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                message["content"] = "\n".join(text_parts)
+
             if "tool_calls" in message and message["tool_calls"]:
                 for tool_call in message["tool_calls"]:
                     f = tool_call.get("function")
@@ -225,6 +236,17 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
         messages = kwargs.get("messages", [])
         for message in messages:
+            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                message["content"] = "\n".join(text_parts)
+
             if "tool_calls" in message and message["tool_calls"]:
                 for tool_call in message["tool_calls"]:
                     f = tool_call.get("function")
@@ -492,6 +514,17 @@ class Qwen35Handler(Qwen35ChatHandler):
         # (Alguns templates como o do Qwen 3.5 usam | items e quebram se for string JSON)
         messages = kwargs.get("messages", [])
         for message in messages:
+            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                message["content"] = "\n".join(text_parts)
+
             if "tool_calls" in message and message["tool_calls"]:
                 for tool_call in message["tool_calls"]:
                     f = tool_call.get("function")
