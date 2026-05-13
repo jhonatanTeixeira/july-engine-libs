@@ -19,13 +19,16 @@ class Gemma4Handler(Gemma4ChatHandler):
             # Flatten content if it's a list (common for non-vision models receiving multimodal data)
             content = message.get("content")
             if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif isinstance(part, str):
-                        text_parts.append(part)
-                message["content"] = "\n".join(text_parts)
+                # Only flatten if there are no images. Vision models need the list format.
+                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
+                if not has_image:
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif isinstance(part, str):
+                            text_parts.append(part)
+                    message["content"] = "\n".join(text_parts)
 
             if "tool_calls" in message and message["tool_calls"]:
                 for tool_call in message["tool_calls"]:
@@ -239,13 +242,16 @@ class QwenChatHandler(LlamaChatCompletionHandler):
             # Flatten content if it's a list (common for non-vision models receiving multimodal data)
             content = message.get("content")
             if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif isinstance(part, str):
-                        text_parts.append(part)
-                message["content"] = "\n".join(text_parts)
+                # Only flatten if there are no images. Vision models need the list format.
+                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
+                if not has_image:
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif isinstance(part, str):
+                            text_parts.append(part)
+                    message["content"] = "\n".join(text_parts)
 
             if "tool_calls" in message and message["tool_calls"]:
                 for tool_call in message["tool_calls"]:
@@ -517,13 +523,16 @@ class Qwen35Handler(Qwen35ChatHandler):
             # Flatten content if it's a list (common for non-vision models receiving multimodal data)
             content = message.get("content")
             if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif isinstance(part, str):
-                        text_parts.append(part)
-                message["content"] = "\n".join(text_parts)
+                # Only flatten if there are no images. Vision models need the list format.
+                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
+                if not has_image:
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif isinstance(part, str):
+                            text_parts.append(part)
+                    message["content"] = "\n".join(text_parts)
 
             if "tool_calls" in message and message["tool_calls"]:
                 for tool_call in message["tool_calls"]:
