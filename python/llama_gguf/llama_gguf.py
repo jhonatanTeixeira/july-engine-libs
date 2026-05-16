@@ -329,7 +329,8 @@ class GGUF:
                         pass
 
                 logger.info(f"GGUF: Loading model {self.meta['model_alias']} on {self.backend} (n_seq_max={self.n_seq_max}, n_ctx_total={effective_n_ctx})")
-                
+                n_threads = os.environ.get("MAX_GGUF_THREADS", None)
+
                 base_params = {
                     "model_path": model_path,
                     "n_gpu_layers": n_gpu_layers,
@@ -340,7 +341,9 @@ class GGUF:
                     "logits_all": self.logits_all,
                     "use_mmap": os.environ.get("USE_MMAP", "true").lower() == "true",
                     "verbose": os.environ.get("LLM_VERBOSE", "false").lower() == "true",
-                    "n_batch": max(int(os.environ.get("LLM_N_BATCH", "512")), 2048)
+                    "n_batch": max(int(os.environ.get("LLM_N_BATCH", "512")), 2048),
+                    "n_threads": int(n_threads) if n_threads else None,
+                    "n_threads_batch": int(n_threads) if n_threads else None,
                 }
 
                 # Flash Attention: metadata > env var > default True
