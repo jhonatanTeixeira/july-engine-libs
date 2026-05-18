@@ -315,6 +315,36 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         content = content.replace('<|im_start|>assistant', '').replace('<|im_end|>', '')
         content = content.strip() or None
 
+        # 3. Fallback: modelo gerou a tool como tag XML direta, ex: <filesystem__list_directory>{"path":"/"}</filesystem__list_directory>
+        # Isso ocorre em modelos menores (Qwen3.5-4B) que misturam o formato XML com o formato padrão
+        if not parsed_tools and content:
+            # Corresponde a: <nome_tool>args_json</nome_tool> ou <nome_tool> (sem args)
+            # nome_tool: letras, dígitos, _ e __ (padrão MCP filesystem__list_directory)
+            fallback_pattern = re.compile(
+                r'<([a-zA-Z][a-zA-Z0-9_]*)(?:>([\s\S]*?)</\1>|(?:\s*/>|\s*$))',
+                re.DOTALL
+            )
+            for fb in fallback_pattern.finditer(content):
+                tool_name = fb.group(1)
+                raw_args  = (fb.group(2) or "").strip()
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                    if not isinstance(args, dict):
+                        args = {}
+                except Exception:
+                    args = {}
+                parsed_tools.append({
+                    "id":       f"call_{uuid.uuid4().hex}",
+                    "type":     "function",
+                    "function": {
+                        "name":      tool_name,
+                        "arguments": json.dumps(args),
+                    }
+                })
+                logger.info(f"QwenChatHandler: fallback XML tool call detectado: {tool_name}({args})")
+            if parsed_tools:
+                content = fallback_pattern.sub('', content).strip() or None
+
         message["content"] = content
         if reasoning:
             message["reasoning_content"] = reasoning
@@ -554,6 +584,8 @@ class Qwen35Handler(Qwen35ChatHandler):
         message = response.get("choices", [{}])[0].get("message", {})
         content = message.get("content", "") or ""
 
+        logger.info(f"Qwen35Handler._parse_response raw content: {repr(content[:300])}")
+
         if not isinstance(content, str):
             return response
 
@@ -603,7 +635,36 @@ class Qwen35Handler(Qwen35ChatHandler):
 
         # Remove as tags de tool call do conteúdo, mas preserva o resto
         content = tool_call_pattern.sub('', content).strip() or None
-        
+
+        # Fallback: modelo gerou bare-tag estilo <filesystem__list_directory>{"path":"/"}</filesystem__list_directory>
+        # ou só <filesystem__list_allowed_directories> (sem corpo). Ocorre em modelos 4B após receber resultado de tool.
+        # Requer __ no nome para evitar falsos positivos com tags HTML comuns.
+        if not parsed_tools and content:
+            fallback_pattern = re.compile(
+                r'<([a-zA-Z][a-zA-Z0-9_]*__[a-zA-Z0-9_]+)(?:>([\s\S]*?)</\1>|/>|>)',
+                re.DOTALL
+            )
+            for fb in fallback_pattern.finditer(content):
+                tool_name = fb.group(1)
+                raw_args  = (fb.group(2) or "").strip()
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                    if not isinstance(args, dict):
+                        args = {}
+                except Exception:
+                    args = {}
+                parsed_tools.append({
+                    "id":       f"call_{uuid.uuid4().hex}",
+                    "type":     "function",
+                    "function": {
+                        "name":      tool_name,
+                        "arguments": json.dumps(args),
+                    }
+                })
+                logger.info(f"Qwen35Handler: fallback XML tool call detectado: {tool_name}({args})")
+            if parsed_tools:
+                content = fallback_pattern.sub('', content).strip() or None
+
         message["content"] = content
         if parsed_tools:
             message["tool_calls"] = parsed_tools
@@ -615,7 +676,7 @@ class Qwen35Handler(Qwen35ChatHandler):
         current_tag = None
         buffer = ""
         called_tools = False
-        
+
         # Estado para parsing de tools em stream
         uid = None
         current_tool_name = None
