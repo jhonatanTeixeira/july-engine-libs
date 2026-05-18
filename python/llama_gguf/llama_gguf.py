@@ -492,8 +492,9 @@ class GGUF:
         async with slot.lock:
             # Sempre reseta para garantir que não há lixo no KV Cache
             try:
+                pass
                 # slot.reset()
-                logger.debug(f"GGUF: Sequence slot KV cache reset")
+                # logger.debug(f"GGUF: Sequence slot KV cache reset")
             except Exception as e:
                 logger.warning(f"GGUF: Could not reset slot: {e}")
 
