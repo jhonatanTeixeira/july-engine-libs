@@ -13,6 +13,18 @@ from .context import request_id_var, acquired_instances_var
 
 logger = logging.getLogger("JulyEngine.Models.GGUF")
 
+# Phrases emitted by llama_cpp when the KV cache / context window is exhausted
+_CTX_OVERFLOW_PHRASES = (
+    "Failed completely even with batch size 1",
+    "Context Shift is explicitly disabled",
+    "Context shift failed",
+    "Context Shift failed",
+)
+
+def _is_ctx_overflow(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(phrase in msg for phrase in _CTX_OVERFLOW_PHRASES)
+
 # Global locks for model loading to prevent concurrent loads of the same file across GGUF instances
 _GGUF_LOAD_LOCKS = {}
 _GGUF_LOAD_LOCKS_LOCK = threading.Lock()
@@ -164,33 +176,69 @@ class SequencePool:
         self._available = asyncio.Queue()
         self._allocated = set()
         self._pool_lock = asyncio.Lock()
+        # KV-cache slot affinity: maps cache_key → preferred SequenceSlot
+        self._pinned: Dict[str, SequenceSlot] = {}
         for slot in slots:
             self._available.put_nowait(slot)
 
-    async def acquire(self) -> SequenceSlot:
-        """Adquire um slot de sequência livre, com suporte a re-entrância por request_id."""
+    async def acquire(self, cache_key: Optional[str] = None) -> tuple["SequenceSlot", bool]:
+        """Adquire um slot de sequência livre, com suporte a re-entrância por request_id.
+
+        Retorna (slot, is_reentrant).
+        - is_reentrant=True  → mesma request já tinha este slot; NÃO resetar o KV cache.
+        - is_reentrant=False → aquisição nova; resetar o KV cache antes de usar.
+
+        Se cache_key for fornecido, tenta reutilizar o mesmo slot KV usado anteriormente
+        para essa conversa (affinity de cache), melhorando o reaproveitamento do KV cache.
+        """
         rid = request_id_var.get()
-        
+
         async with self._pool_lock:
             if rid:
                 acquired = acquired_instances_var.get()
                 if self in acquired:
                     # Re-entrância: Esta request já reservou uma instância deste pool
-                    return acquired[self]
-        
-        # Caso contrário, espera por uma instância livre no pool
-        # Fora do _pool_lock para permitir que outros chamem acquire enquanto um espera
+                    return acquired[self], True
+
+            # Tenta o slot preferido imediatamente (sem bloquear)
+            if cache_key and cache_key in self._pinned:
+                preferred = self._pinned[cache_key]
+                drained = []
+                found = None
+                try:
+                    while True:
+                        s = self._available.get_nowait()
+                        if s is preferred:
+                            found = s
+                            break
+                        drained.append(s)
+                except asyncio.QueueEmpty:
+                    pass
+                for s in drained:
+                    self._available.put_nowait(s)
+
+                if found is not None:
+                    self._allocated.add(found)
+                    if rid:
+                        acquired = acquired_instances_var.get()
+                        acquired[self] = found
+                        acquired_instances_var.set(acquired)
+                    return found, False
+                # Preferred slot busy — fall through to normal wait
+
+        # Espera por uma instância livre no pool (fora do _pool_lock para não bloquear releases)
         slot = await self._available.get()
-        
+
         async with self._pool_lock:
             self._allocated.add(slot)
             if rid:
-                # Reserva a instância para futuras chamadas nesta mesma request
                 acquired = acquired_instances_var.get()
                 acquired[self] = slot
                 acquired_instances_var.set(acquired)
-            
-        return slot
+            if cache_key:
+                self._pinned[cache_key] = slot
+
+        return slot, False
 
     def release(self, slot: SequenceSlot):
         """Libera a instância, a menos que esteja reservada para re-entrância."""
@@ -482,21 +530,20 @@ class GGUF:
         if force_reasoning:
             messages.append({"role": "assistant", "content": "<think>\n"})
 
-        # Adquire um slot do pool
-        slot = await self.sequence_pool.acquire()
-        
-        # O lock do slot garante que apenas uma operação ocorra por seq_id
-        # Se for uma chamada re-entrante da mesma request, ela esperará aqui
-        # até que a operação anterior (se houver) termine.
-        # Nota: Chamadas de ferramenta geralmente são sequenciais.
+        # Adquire um slot do pool — usa cache_key para affinity de KV cache por conversa
+        cache_key = headers.get("x-cache-key") or None
+        slot, is_reentrant = await self.sequence_pool.acquire(cache_key=cache_key)
+
         async with slot.lock:
-            # Sempre reseta para garantir que não há lixo no KV Cache
-            try:
-                pass
-                # slot.reset()
-                # logger.debug(f"GGUF: Sequence slot KV cache reset")
-            except Exception as e:
-                logger.warning(f"GGUF: Could not reset slot: {e}")
+            # Reset KV cache only on fresh (external) acquisitions.
+            # Re-entrant calls (internal tool calls within the same HTTP request) must NOT reset
+            # or they lose accumulated KV context and cause M-RoPE "Context Shift" errors.
+            if not is_reentrant:
+                try:
+                    slot.reset()
+                    logger.debug("GGUF: Sequence slot KV cache reset (fresh acquisition)")
+                except Exception as e:
+                    logger.warning(f"GGUF: Could not reset slot: {e}")
 
             try:
                 response = slot.create_chat_completion(
@@ -506,6 +553,20 @@ class GGUF:
                 )
             except Exception as e:
                 self.sequence_pool.release(slot)
+                if _is_ctx_overflow(e):
+                    logger.warning(f"GGUF: Context window overflow (non-stream) — finish_reason='length': {e}")
+                    return {
+                        "id": f"chatcmpl-ctx-{uuid.uuid4().hex[:8]}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": self.meta.get("model_alias", "unknown"),
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": ""},
+                            "finish_reason": "length",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    }
                 raise e
 
             if stream:
@@ -612,6 +673,16 @@ class GGUF:
                                 chunk_out["choices"][0]["delta"] = {target_key: buffer}
                                 yield chunk_out
                                 
+                        except RuntimeError as ctx_err:
+                            if _is_ctx_overflow(ctx_err):
+                                logger.warning(f"GGUF: Context window overflow (stream) — finish_reason='length': {ctx_err}")
+                                yield {
+                                    "id": f"chatcmpl-ctx-{uuid.uuid4().hex[:8]}",
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                                }
+                            else:
+                                raise
                         finally:
                             # Libera o slot ao fim do stream
                             self.sequence_pool.release(slot)
