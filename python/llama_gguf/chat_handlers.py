@@ -266,7 +266,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         response = self.handler(**kwargs)
 
         if kwargs.get("stream"):
-            return self._stream_response(response)
+            return self._stream_response(response, messages=messages)
         else:
             return self._parse_response(response)
 
@@ -354,10 +354,20 @@ class QwenChatHandler(LlamaChatCompletionHandler):
 
         return response
 
-    def _stream_response(self, response: Iterator):
+    def _stream_response(self, response: Iterator, messages: List[Dict[str, Any]] = None):
         current_tag = None
         buffer = ""
         called_tools = False
+        first_chunk = True
+
+        # Detecção de pensamento pré-semeado (prompt prefill)
+        is_preseeded_think = False
+        if messages:
+            last_msg = messages[-1]
+            if last_msg.get("role") == "assistant" and last_msg.get("content"):
+                content = last_msg["content"]
+                if isinstance(content, str) and (content.strip() == "<think>" or content.strip() == "<thought>" or content.strip() == "<|thought|>"):
+                    is_preseeded_think = True
 
         for chunk in response:
             delta = chunk.get("choices", [{}])[0].get("delta", {})
@@ -366,6 +376,15 @@ class QwenChatHandler(LlamaChatCompletionHandler):
             if not content:
                 yield chunk
                 continue
+
+            if first_chunk:
+                first_chunk = False
+                if is_preseeded_think and not content.startswith("<think>") and not content.startswith("<thought>") and not content.startswith("<|thought|>"):
+                    import copy
+                    chunk_start = copy.deepcopy(chunk)
+                    chunk_start["choices"][0]["delta"]["content"] = "<think>"
+                    yield chunk_start
+                    current_tag = 'thought'
 
             buffer += content
 
@@ -576,13 +595,16 @@ class Qwen35Handler(Qwen35ChatHandler):
         response = super().__call__(**kwargs)
 
         if kwargs.get("stream"):
-            return self._stream_response(response)
+            return self._stream_response(response, messages=messages)
         else:
             return self._parse_response(response)
 
     def _parse_response(self, response):
         message = response.get("choices", [{}])[0].get("message", {})
         content = message.get("content", "") or ""
+
+        if self.enable_thinking and '</think>' in content:
+            content = '<think>\n' + content
 
         logger.info(f"Qwen35Handler._parse_response raw content: {repr(content[:300])}")
 
@@ -625,14 +647,6 @@ class Qwen35Handler(Qwen35ChatHandler):
                     }
                 })
 
-        # Extração de Thinking Block
-        thinking_pattern = re.compile(r'<(?:\|thought\||think|thought|\|channel>thought)>([\s\S]+?)(?:</(?:think|thought)>|<channel\|>|(?=<\|)|$)', re.DOTALL)
-        think_match = thinking_pattern.search(content)
-        if think_match:
-            thinking = think_match.group(1).strip()
-            message["reasoning_content"] = thinking
-            content = content.replace(think_match.group(0), "").strip()
-
         # Remove as tags de tool call do conteúdo, mas preserva o resto
         content = tool_call_pattern.sub('', content).strip() or None
 
@@ -672,7 +686,7 @@ class Qwen35Handler(Qwen35ChatHandler):
 
         return response
 
-    def _stream_response(self, response: Iterator):
+    def _stream_response(self, response: Iterator, messages: List[Dict[str, Any]] = None):
         current_tag = None
         buffer = ""
         called_tools = False
@@ -682,8 +696,19 @@ class Qwen35Handler(Qwen35ChatHandler):
         current_tool_name = None
         current_param_name = None
         first_param = True
+        chunk_count = 0
+        print(messages, '\n\n\n')
+        last_message = messages[-1]
 
+        tool_response = last_message.get('role') == 'tool'
+        
         for chunk in response:
+            chunk_count += 1 
+            
+            if chunk_count == 1 and not tool_response:
+                if self.enable_thinking:
+                    chunk['choices'][0]['delta']['content'] = '<think>' + chunk['choices'][0]['delta'].get('content', '')
+
             delta = chunk.get("choices", [{}])[0].get("delta", {})
             content = delta.get("content", "")
 

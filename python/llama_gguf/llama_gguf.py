@@ -476,7 +476,7 @@ class GGUF:
                             base_params["chat_handler"] = Qwen25VLChatHandler(clip_model_path=mmproj_path, **handler_kwargs) if mmproj_path else Qwen25VLChatHandler(**handler_kwargs)
                         elif v_handler == "qwen35":
                             from .chat_handlers import Qwen35Handler
-                            base_params["chat_handler"] = Qwen35Handler(clip_model_path=mmproj_path, **handler_kwargs) if mmproj_path else Qwen35Handler(**handler_kwargs)
+                            base_params["chat_handler"] = Qwen35Handler(clip_model_path=mmproj_path, preserve_thinking=True, **handler_kwargs) if mmproj_path else Qwen35Handler(preserve_thinking=True, **handler_kwargs)
                         elif v_handler == "moondream":
                             from llama_cpp.llama_chat_format import MoondreamChatHandler
                             base_params["chat_handler"] = MoondreamChatHandler(clip_model_path=mmproj_path, **handler_kwargs)
@@ -540,7 +540,7 @@ class GGUF:
             # or they lose accumulated KV context and cause M-RoPE "Context Shift" errors.
             if not is_reentrant:
                 try:
-                    slot.reset()
+                    # slot.reset()
                     logger.debug("GGUF: Sequence slot KV cache reset (fresh acquisition)")
                 except Exception as e:
                     logger.warning(f"GGUF: Could not reset slot: {e}")
