@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "july-telemetry"
+version = "1.0.0"
+description = "Prometheus metrics and OpenTelemetry setup for the July ecosystem"
+requires-python = ">=3.9"
+dependencies = [
+    "prometheus-client",
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["july_telemetry*"]

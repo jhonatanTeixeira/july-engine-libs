@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "july-engine-routers"
+version = "1.0.0"
+description = "FastAPI routers for July Engine — installable shell for other monorepo projects"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi[standard]",
+    "pydantic",
+    "july-telemetry",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["july_routers*"]
