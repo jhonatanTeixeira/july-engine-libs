@@ -89,3 +89,6 @@ class BridgeInterface:
 
     async def process_pdf_extract(self, pdf_bytes: bytes):
         raise NotImplementedError
+
+    async def process_video_generation(self, payload: dict, headers: dict):
+        raise NotImplementedError

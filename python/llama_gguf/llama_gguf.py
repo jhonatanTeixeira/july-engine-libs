@@ -429,7 +429,8 @@ class GGUF:
                 if meta.get("template"):
                     base_params["chat_format"] = meta["template"]
                 else:
-                    base_params["chat_format"] = "jinja" if "jinja" in llama_cpp.llama_chat_format.CHAT_FORMATS else caps["chat_format"]
+                    _formats = getattr(llama_cpp.llama_chat_format, "CHAT_FORMATS", {})
+                    base_params["chat_format"] = "jinja" if "jinja" in _formats else caps["chat_format"]
 
                 # ==========================================
                 # LOAD SINGLE MULTI-SEQUENCE INSTANCE
