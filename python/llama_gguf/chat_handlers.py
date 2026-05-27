@@ -14,6 +14,7 @@ from llama_cpp.llama_chat_format import (
     Jinja2ChatFormatter,
     LlamaChatCompletionHandler,
     MTMDChatHandler,
+    Qwen35ChatHandler,
     _convert_text_completion_to_chat,
     _convert_text_completion_chunks_to_chat,
 )
@@ -248,6 +249,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
     def __call__(self, **kwargs):
         # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
         messages = kwargs.get("messages", [])
+
         for message in messages:
             # Flatten content if it's a list (common for non-vision models receiving multimodal data)
             content = message.get("content")
@@ -271,7 +273,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                             f["arguments"] = json.loads(f["arguments"])
                         except Exception:
                             pass
-
+        
         # O handler interno do Jinja2ChatFormatter faz o trabalho pesado de renderização
         response = self.handler(**kwargs)
 
@@ -570,293 +572,45 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         }
             
 
-class Qwen35Handler(MTMDChatHandler):
-    """
-    Handler para Qwen3 / Qwen3.5+ com o template oficial correto (sem prefill de <think>).
-    Estende MTMDChatHandler diretamente para controle total sobre template e parsing.
-    Suporta modelos de texto puro (sem clip_model_path) e modelos de visão.
-
-    Diferença chave vs Qwen35ChatHandler do vendor:
-    - Remove o prefill `<think>\\n` do add_generation_prompt (o modelo gera naturalmente).
-    - O `enable_thinking=False` ainda injeta `<think>\\n\\n</think>\\n\\n` para suprimir reasoning.
-    - Nenhuma gambiarra de injeção de <think> no stream — o modelo gera o token real.
-    """
-
-    CHAT_FORMAT = (
-        "{%- set image_count = namespace(value=0) -%}"
-        "{%- set video_count = namespace(value=0) -%}"
-        "{%- macro render_content(content, do_vision_count, is_system_content=false) -%}"
-        "    {%- if content is string -%}"
-        "        {{- content -}}"
-        "    {%- elif content is iterable and content is not mapping -%}"
-        "        {%- for item in content -%}"
-        "            {%- if 'image_url' in item or item.type == 'image_url' -%}"
-        "                {%- if is_system_content -%}"
-        "                    {{- raise_exception('System message cannot contain images.') -}}"
-        "                {%- endif -%}"
-        "                {%- if do_vision_count -%}"
-        "                    {%- set image_count.value = image_count.value + 1 -%}"
-        "                {%- endif -%}"
-        "                {%- if add_vision_id -%}"
-        "                    {{- 'Picture ' -}}"
-        "                    {{- image_count.value | string -}}"
-        "                    {{- ': ' -}}"
-        "                {%- endif -%}"
-        "                {{- '<|vision_start|>' -}}"
-        "                {%- if item.image_url is string -%}"
-        "                    {{- item.image_url -}}"
-        "                {%- else -%}"
-        "                    {{- item.image_url.url -}}"
-        "                {%- endif -%}"
-        "                {{- '<|vision_end|>' -}}"
-        "            {%- elif 'text' in item -%}"
-        "                {{- item.text -}}"
-        "            {%- endif -%}"
-        "        {%- endfor -%}"
-        "    {%- elif content is none or content is undefined -%}"
-        "        {{- '' -}}"
-        "    {%- endif -%}"
-        "{%- endmacro -%}"
-        "{%- if not messages -%}"
-        "    {{- raise_exception('No messages provided.') -}}"
-        "{%- endif -%}"
-        "{%- if tools and tools is iterable and tools is not mapping -%}"
-        "    {{- '<|im_start|>system\n' -}}"
-        "    {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' -}}"
-        "    {%- for tool in tools -%}"
-        "        {{- '\n' -}}"
-        "        {{- tool | tojson -}}"
-        "    {%- endfor -%}"
-        "    {{- '\n</tools>' -}}"
-        "    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' -}}"
-        "    {%- if messages[0].role == 'system' -%}"
-        "        {%- set content = render_content(messages[0].content, false, true) | trim -%}"
-        "        {%- if content -%}"
-        "            {{- '\n\n' + content -}}"
-        "        {%- endif -%}"
-        "    {%- endif -%}"
-        "    {{- '<|im_end|>\n' -}}"
-        "{%- elif messages[0].role == 'system' -%}"
-        "    {%- set content = render_content(messages[0].content, false, true) -%}"
-        "    {{- '<|im_start|>system\n' + content + '<|im_end|>\n' -}}"
-        "{%- endif -%}"
-        "{%- set ns = namespace(multi_step_tool=true, last_query_index=messages | length - 1) -%}"
-        "{%- for message in messages[::-1] -%}"
-        "    {%- set index = messages | length - 1 - loop.index0 -%}"
-        "    {%- if ns.multi_step_tool and message.role == 'user' -%}"
-        "        {%- set content = render_content(message.content, false) | trim -%}"
-        "        {%- if not (content.startswith('<tool_response>') and content.endswith('</tool_response>')) -%}"
-        "            {%- set ns.multi_step_tool = false -%}"
-        "            {%- set ns.last_query_index = index -%}"
-        "        {%- endif -%}"
-        "    {%- endif -%}"
-        "{%- endfor -%}"
-        "{%- if ns.multi_step_tool -%}"
-        "    {{- raise_exception('No user query found in messages.') -}}"
-        "{%- endif -%}"
-        "{%- for message in messages -%}"
-        "    {%- set content = render_content(message.content, true) | trim -%}"
-        "    {%- if message.role == 'system' -%}"
-        "        {%- if not loop.first -%}"
-        "            {{- raise_exception('System message must be at the beginning.') -}}"
-        "        {%- endif -%}"
-        "    {%- elif message.role == 'user' -%}"
-        "        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' -}}"
-        "    {%- elif message.role == 'assistant' -%}"
-        "        {%- set reasoning_content = '' -%}"
-        "        {%- if message.reasoning_content is string -%}"
-        "            {%- set reasoning_content = message.reasoning_content -%}"
-        "        {%- elif '</think>' in content -%}"
-        "            {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') -%}"
-        "            {%- set content = content.split('</think>')[-1].lstrip('\n') -%}"
-        "        {%- endif -%}"
-        "        {%- set reasoning_content = reasoning_content | trim -%}"
-        "        {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) -%}"
-        "            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content -}}"
-        "        {%- else -%}"
-        "            {{- '<|im_start|>' + message.role + '\n' + content -}}"
-        "        {%- endif -%}"
-        "        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping -%}"
-        "            {%- for tool_call in message.tool_calls -%}"
-        "                {%- if tool_call.function is defined -%}"
-        "                    {%- set tool_call = tool_call.function -%}"
-        "                {%- endif -%}"
-        "                {%- if loop.first -%}"
-        "                    {%- if content | trim -%}"
-        "                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' -}}"
-        "                    {%- else -%}"
-        "                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' -}}"
-        "                    {%- endif -%}"
-        "                {%- else -%}"
-        "                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' -}}"
-        "                {%- endif -%}"
-        "                {%- if tool_call.arguments is defined -%}"
-        "                    {%- for (args_name, args_value) in tool_call.arguments | items -%}"
-        "                        {{- '<parameter=' + args_name + '>\n' -}}"
-        "                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}"
-        "                        {{- args_value -}}"
-        "                        {{- '\n</parameter>' -}}"
-        "                    {%- endfor -%}"
-        "                {%- endif -%}"
-        "                {{- '</function>\n</tool_call>' -}}"
-        "            {%- endfor -%}"
-        "        {%- endif -%}"
-        "        {{- '<|im_end|>\n' -}}"
-        "    {%- elif message.role == 'tool' -%}"
-        "        {%- if loop.previtem and loop.previtem.role != 'tool' -%}"
-        "            {{- '<|im_start|>user' -}}"
-        "        {%- endif -%}"
-        "        {{- '\n<tool_response>\n' -}}"
-        "        {{- content -}}"
-        "        {{- '\n</tool_response>' -}}"
-        "        {%- if not loop.last and loop.nextitem.role != 'tool' -%}"
-        "            {{- '<|im_end|>\n' -}}"
-        "        {%- elif loop.last -%}"
-        "            {{- '<|im_end|>\n' -}}"
-        "        {%- endif -%}"
-        "    {%- else -%}"
-        "        {{- raise_exception('Unexpected message role.') -}}"
-        "    {%- endif -%}"
-        "{%- endfor -%}"
-        # add_generation_prompt: official Qwen3 behavior — NO <think> prefill when enable_thinking=True.
-        # The model generates <think> naturally as its first token.
-        # Only inject empty <think></think> when enable_thinking=False to suppress reasoning.
-        "{%- if add_generation_prompt -%}"
-        "    {{- '<|im_start|>assistant\n' -}}"
-        "    {%- if enable_thinking is defined and enable_thinking is false -%}"
-        "        {{- '<think>\n\n</think>\n\n' -}}"
-        "    {%- endif -%}"
-        "{%- endif -%}"
-    )
-
-    def __init__(
-        self,
-        enable_thinking: bool = True,
-        preserve_thinking: bool = False,
-        add_vision_id: bool = True,
-        clip_model_path: Optional[str] = None,
-        verbose: bool = False,
-        use_gpu: bool = True,
-        image_min_tokens: int = -1,
-        image_max_tokens: int = -1,
-        **kwargs,
-    ):
-        if clip_model_path:
-            super().__init__(
-                clip_model_path=clip_model_path,
-                verbose=verbose,
-                use_gpu=use_gpu,
-                image_min_tokens=image_min_tokens,
-                image_max_tokens=image_max_tokens,
-            )
-        else:
-            # Modo texto puro: configura atributos sem carregar clip model
-            self.log_prefix = self.__class__.__name__
-            self.clip_model_path = None
-            self.image_min_tokens = image_min_tokens
-            self.image_max_tokens = image_max_tokens
-            self.use_gpu = use_gpu
-            self.verbose = verbose
-            self._mtmd_cpp = None
-            self.mtmd_ctx = None
-            self.extra_template_arguments = {}
-            self.chat_template = ImmutableSandboxedEnvironment(
-                trim_blocks=True,
-                lstrip_blocks=True,
-            ).from_string(self.CHAT_FORMAT)
-            self._exit_stack = ExitStack()
-
-        self.enable_thinking = enable_thinking
-        self.preserve_thinking = preserve_thinking
-        self.extra_template_arguments["enable_thinking"] = enable_thinking
-        self.extra_template_arguments["preserve_thinking"] = preserve_thinking
-        self.extra_template_arguments["add_vision_id"] = add_vision_id
+class Qwen35Handler(Qwen35ChatHandler):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
     def __call__(self, **kwargs):
+        # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
+        # (Alguns templates como o do Qwen 3.5 usam | items e quebram se for string JSON)
         messages = kwargs.get("messages", [])
-
-        # Normaliza mensagens: flatten de content em lista, arguments de tool_call como dict
         for message in messages:
+            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
             content = message.get("content")
             if isinstance(content, list):
-                has_image = any(
-                    isinstance(p, dict) and p.get("type") in ["image_url", "image"]
-                    for p in content
-                )
+                # Only flatten if there are no images. Vision models need the list format.
+                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
                 if not has_image:
                     text_parts = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            text_parts.append(p.get("text", ""))
-                        elif isinstance(p, str):
-                            text_parts.append(p)
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        elif isinstance(part, str):
+                            text_parts.append(part)
                     message["content"] = "\n".join(text_parts)
 
-            if message.get("tool_calls"):
-                for tc in message["tool_calls"]:
-                    f = tc.get("function")
+
+            if "tool_calls" in message and message["tool_calls"]:
+                for tool_call in message["tool_calls"]:
+                    f = tool_call.get("function")
                     if f and isinstance(f.get("arguments"), str):
                         try:
                             f["arguments"] = json.loads(f["arguments"])
                         except Exception:
                             pass
 
-        if self.clip_model_path:
-            llama = kwargs.get("llama")
-            if llama and hasattr(llama, "input_ids"):
-                llama.input_ids.fill(0)
-            response = super().__call__(**kwargs)
-        else:
-            response = self._call_text_only(**kwargs)
+        response = super().__call__(**kwargs)
 
         if kwargs.get("stream"):
             return self._stream_response(response)
         else:
             return self._parse_response(response)
-
-    def _call_text_only(self, **kwargs):
-        """Modo texto puro: renderiza o template Jinja2 e chama llama.create_completion."""
-        llama = kwargs["llama"]
-        messages = kwargs.get("messages", [])
-        tools = kwargs.get("tools")
-        stream = kwargs.get("stream", False)
-        stop = kwargs.get("stop") or []
-        if isinstance(stop, str):
-            stop = [stop]
-
-        eos = llama.detokenize([llama.token_eos()]).decode("utf-8", errors="ignore")
-        bos_id = llama.token_bos()
-        bos = llama.detokenize([bos_id]).decode("utf-8", errors="ignore") if bos_id >= 0 else ""
-
-        prompt = self.chat_template.render(
-            messages=messages,
-            tools=tools,
-            add_generation_prompt=True,
-            eos_token=eos,
-            bos_token=bos,
-            raise_exception=lambda msg: (_ for _ in ()).throw(ValueError(msg)),
-            strftime_now=lambda fmt="%Y-%m-%d %H:%M:%S": datetime.datetime.now().strftime(fmt),
-            **self.extra_template_arguments,
-        )
-
-        tokens = llama.tokenize(prompt.encode("utf-8"), add_bos=False, special=True)
-        stop_strs = list(stop) + [eos, "<|im_end|>"]
-
-        raw = llama.create_completion(
-            prompt=tokens,
-            stream=stream,
-            max_tokens=kwargs.get("max_tokens"),
-            temperature=kwargs.get("temperature", 0.2),
-            top_p=kwargs.get("top_p", 0.95),
-            top_k=kwargs.get("top_k", 40),
-            min_p=kwargs.get("min_p", 0.05),
-            repeat_penalty=kwargs.get("repeat_penalty", 1.1),
-            stop=stop_strs,
-        )
-
-        if stream:
-            return _convert_text_completion_chunks_to_chat(raw)
-        return _convert_text_completion_to_chat(raw)
 
     def _parse_response(self, response):
         message = response.get("choices", [{}])[0].get("message", {})
@@ -865,60 +619,53 @@ class Qwen35Handler(MTMDChatHandler):
         if not isinstance(content, str):
             return response
 
-        # Extração de Tool Calls: formato Qwen3.5 XML
-        # <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        # Extração de Tool Calls (Formato Qwen 3.5 XML-like)
+        # Ex: <tool_call> <function=search_web> <parameter=query>... </parameter> </function> </tool_call>
         tool_call_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
         function_pattern = re.compile(r'<function=(.*?)>(.*?)</function>', re.DOTALL)
         parameter_pattern = re.compile(r'<parameter=(.*?)>(.*?)</parameter>', re.DOTALL)
-
+        
         parsed_tools = []
         for tc_match in tool_call_pattern.finditer(content):
             raw_tc = tc_match.group(1)
             for fn_match in function_pattern.finditer(raw_tc):
                 name = fn_match.group(1).strip()
+                params_raw = fn_match.group(2)
                 args = {}
-                for pm in parameter_pattern.finditer(fn_match.group(2)):
-                    k = pm.group(1).strip()
-                    v = pm.group(2).strip()
-                    if v.lower() == "true":   v = True
-                    elif v.lower() == "false": v = False
-                    elif v.isdigit():          v = int(v)
+                for param_match in parameter_pattern.finditer(params_raw):
+                    p_name = param_match.group(1).strip()
+                    p_val = param_match.group(2).strip()
+                    
+                    # Conversão básica de tipos
+                    if p_val.lower() == "true": p_val = True
+                    elif p_val.lower() == "false": p_val = False
+                    elif p_val.isdigit(): p_val = int(p_val)
                     else:
-                        try: v = float(v)
+                        try: p_val = float(p_val)
                         except: pass
-                    args[k] = v
+                    args[p_name] = p_val
+                
+                unique_id = uuid.uuid4().hex
                 parsed_tools.append({
-                    "id": f"call_{uuid.uuid4().hex}",
+                    "id": f"call_{unique_id}",
                     "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(args)},
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    }
                 })
 
-        content = tool_call_pattern.sub("", content).strip() or None
+        # Extração de Thinking Block
+        thinking_pattern = re.compile(r'<(?:\|thought\||think|thought|\|channel>thought)>([\s\S]+?)(?:</(?:think|thought)>|<channel\|>|(?=<\|)|$)', re.DOTALL)
+        think_match = thinking_pattern.search(content)
+        if think_match:
+            thinking = think_match.group(1).strip()
+            message["reasoning_content"] = thinking
+            content = content.replace(think_match.group(0), "").strip()
 
-        # Fallback: bare XML com __ no nome (modelos menores)
-        if not parsed_tools and content:
-            fallback_pattern = re.compile(
-                r'<([a-zA-Z][a-zA-Z0-9_]*__[a-zA-Z0-9_]+)(?:>([\s\S]*?)</\1>|/>|>)',
-                re.DOTALL
-            )
-            for fb in fallback_pattern.finditer(content):
-                tool_name = fb.group(1)
-                raw_args = (fb.group(2) or "").strip()
-                try:
-                    args = json.loads(raw_args) if raw_args else {}
-                    if not isinstance(args, dict):
-                        args = {}
-                except Exception:
-                    args = {}
-                parsed_tools.append({
-                    "id": f"call_{uuid.uuid4().hex}",
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": json.dumps(args)},
-                })
-                logger.info(f"Qwen35Handler: fallback XML tool call: {tool_name}({args})")
-            if parsed_tools:
-                content = fallback_pattern.sub("", content).strip() or None
-
+        # Remove as tags de tool call do conteúdo, mas preserva o resto
+        content = tool_call_pattern.sub('', content).strip() or None
+        
         message["content"] = content
         if parsed_tools:
             message["tool_calls"] = parsed_tools
@@ -927,15 +674,12 @@ class Qwen35Handler(MTMDChatHandler):
         return response
 
     def _stream_response(self, response: Iterator):
-        """
-        Processa stream do Qwen3: passa <think>...</think> transparentemente para o
-        stream_adapter e parseia <tool_call>...</tool_call> em deltas de tool_calls.
-        Sem injeção de <think> — o modelo gera o token naturalmente.
-        """
         current_tag = None
         buffer = ""
         called_tools = False
+        last_usage = None
 
+        # Estado para parsing de tools em stream
         uid = None
         current_tool_name = None
         current_param_name = None
@@ -945,17 +689,73 @@ class Qwen35Handler(MTMDChatHandler):
             delta = chunk.get("choices", [{}])[0].get("delta", {})
             content = delta.get("content", "")
 
+            # Captura usage de qualquer chunk para repassar no chunk final
+            if chunk.get("usage"):
+                last_usage = chunk["usage"]
+
             if not content:
+                # Suprime chunks sem conteúdo (finish_reason stop/null, usage) após tool calls
+                if called_tools:
+                    continue
                 yield chunk
+                continue
+
+            # Suprime conteúdo residual (ex: '\n\n') que o modelo emite após fechar </tool_call>
+            if called_tools and not current_tag:
                 continue
 
             buffer += content
 
-            # Processamento de Tool Call ativa
+            # Detecção de Início de Tool Call
+            if not current_tag:
+                if '<tool_call>' in buffer:
+                    current_tag = 'tool_call'
+                    called_tools = True
+                    before, after = buffer.split('<tool_call>', 1)
+                    if before:
+                        chunk_copy = json.loads(json.dumps(chunk))
+                        chunk_copy["choices"][0]["delta"]["content"] = before
+                        yield chunk_copy
+                    buffer = after
+                    # Não retornamos continue aqui para processar o 'after' imediatamente
+                
+                # Se não entrou em tag de tool_call, verifica se pode emitir parte do buffer
+                if not current_tag:
+                    while buffer:
+                        idx = buffer.find('<')
+                        if idx > 0:
+                            chunk_copy = json.loads(json.dumps(chunk))
+                            chunk_copy["choices"][0]["delta"]["content"] = buffer[:idx]
+                            yield chunk_copy
+                            buffer = buffer[idx:]
+                        elif idx == 0:
+                            if "<tool_call>".startswith(buffer):
+                                # Prefixo de tool_call (pode ser incompleto), para o while e espera próximo chunk
+                                break
+                            else:
+                                # Não é prefixo, emite o '<' e continua o while
+                                chunk_copy = json.loads(json.dumps(chunk))
+                                chunk_copy["choices"][0]["delta"]["content"] = "<"
+                                yield chunk_copy
+                                buffer = buffer[1:]
+                        else:
+                            # Não tem '<' no buffer
+                            chunk_copy = json.loads(json.dumps(chunk))
+                            chunk_copy["choices"][0]["delta"]["content"] = buffer
+                            yield chunk_copy
+                            buffer = ""
+                            break
+                    continue
+
+            # Processamento de Tool Call Ativa
             if current_tag == 'tool_call':
+                # Fim da tool call
                 if '</tool_call>' in buffer:
+                    # Se uma função ainda estava aberta, fecha-a
                     if current_tool_name:
                         chunk_end = json.loads(json.dumps(chunk))
+                        chunk_end["choices"][0]["delta"].pop("content", None)
+                        chunk_end["choices"][0]["delta"].pop("reasoning_content", None)
                         chunk_end["choices"][0]["delta"]["tool_calls"] = [{
                             "index": 0, "id": f"call_{uid}", "function": {"arguments": "}"}
                         }]
@@ -967,114 +767,117 @@ class Qwen35Handler(MTMDChatHandler):
                     current_tag = None
                     continue
 
+                # Início da função: <function=name>
                 if not current_tool_name:
                     fn_match = re.search(r'<function=(.*?)>', buffer)
                     if fn_match:
                         current_tool_name = fn_match.group(1).strip().replace('"', '').replace("'", "")
                         uid = uuid.uuid4().hex[:10]
                         first_param = True
-
+                        
+                        # 1. Emite o início da tool call
                         chunk_head = json.loads(json.dumps(chunk))
+                        chunk_head["choices"][0]["delta"].pop("content", None)
+                        chunk_head["choices"][0]["delta"].pop("reasoning_content", None)
                         chunk_head["choices"][0]["delta"]["tool_calls"] = [{
-                            "index": 0, "id": f"call_{uid}", "type": "function",
-                            "function": {"name": current_tool_name}
+                            "index": 0, "id": f"call_{uid}", "type": "function", "function": {"name": current_tool_name}
                         }]
                         yield chunk_head
 
+                        # 2. Inicia o JSON dos argumentos
                         chunk_start_args = json.loads(json.dumps(chunk))
+                        chunk_start_args["choices"][0]["delta"].pop("content", None)
+                        chunk_start_args["choices"][0]["delta"].pop("reasoning_content", None)
                         chunk_start_args["choices"][0]["delta"]["tool_calls"] = [{
                             "index": 0, "id": f"call_{uid}", "function": {"arguments": "{"}
                         }]
                         yield chunk_start_args
-
+                        
                         buffer = buffer.split(fn_match.group(0), 1)[1]
                         continue
-
+                
+                # Fim da função: </function>
                 if current_tool_name and '</function>' in buffer:
                     chunk_end = json.loads(json.dumps(chunk))
+                    chunk_end["choices"][0]["delta"].pop("content", None)
+                    chunk_end["choices"][0]["delta"].pop("reasoning_content", None)
                     chunk_end["choices"][0]["delta"]["tool_calls"] = [{
                         "index": 0, "id": f"call_{uid}", "function": {"arguments": "}"}
                     }]
                     yield chunk_end
                     current_tool_name = None
+                    
                     _, rest = buffer.split('</function>', 1)
                     buffer = rest
                     continue
 
+                # Processamento de Parâmetros dentro da função ativa
                 if current_tool_name:
+                    # Se não estamos capturando um parâmetro, busca o próximo <parameter=name>
                     if not current_param_name:
                         param_start_match = re.search(r'<parameter=(.*?)>', buffer)
                         if param_start_match:
                             current_param_name = param_start_match.group(1).strip().replace('"', '').replace("'", "")
                             buffer = buffer.split(param_start_match.group(0), 1)[1]
-
-                    if current_param_name and '</parameter>' in buffer:
-                        val, rest = buffer.split('</parameter>', 1)
-                        val = val.strip()
-                        v_lower = val.lower()
-                        if v_lower == "true":    val_parsed = True
-                        elif v_lower == "false": val_parsed = False
-                        elif val.isdigit():      val_parsed = int(val)
-                        else:
-                            try: val_parsed = float(val)
-                            except: val_parsed = val
-
-                        arg_delta = f"{'' if first_param else ', '}{json.dumps(current_param_name)}: {json.dumps(val_parsed)}"
-                        first_param = False
-
-                        chunk_args = json.loads(json.dumps(chunk))
-                        chunk_args["choices"][0]["delta"]["tool_calls"] = [{
-                            "index": 0, "id": f"call_{uid}", "function": {"arguments": arg_delta}
-                        }]
-                        yield chunk_args
-                        buffer = rest
-                        current_param_name = None
-                        continue
-
+                            # Continua para processar o valor se estiver no buffer
+                    
+                    # Se estamos capturando um parâmetro, busca o fim </parameter>
+                    if current_param_name:
+                        if '</parameter>' in buffer:
+                            val, rest = buffer.split('</parameter>', 1)
+                            val = val.strip()
+                            
+                            # Conversão de tipos
+                            v_lower = val.lower()
+                            if v_lower == "true": val_parsed = True
+                            elif v_lower == "false": val_parsed = False
+                            elif val.isdigit(): val_parsed = int(val)
+                            else:
+                                try: val_parsed = float(val)
+                                except: val_parsed = val
+                            
+                            arg_key = json.dumps(current_param_name)
+                            arg_val = json.dumps(val_parsed)
+                            
+                            arg_delta = f"{'' if first_param else ', '}{arg_key}: {arg_val}"
+                            first_param = False
+                            
+                            chunk_args = json.loads(json.dumps(chunk))
+                            chunk_args["choices"][0]["delta"].pop("content", None)
+                            chunk_args["choices"][0]["delta"].pop("reasoning_content", None)
+                            chunk_args["choices"][0]["delta"]["tool_calls"] = [{
+                                "index": 0, "id": f"call_{uid}", "function": {"arguments": arg_delta}
+                            }]
+                            yield chunk_args
+                            
+                            buffer = rest
+                            current_param_name = None
+                            continue
+                
+                # Enquanto estamos dentro de <tool_call>, nunca emitimos conteúdo para o usuário
+                # Se o buffer crescer demais sem tags, algo está errado, mas mantemos o buffer
                 if len(buffer) > 1000 and '<' not in buffer:
+                    # Fallback preventivo: se parecer texto perdido, limpa
                     buffer = ""
                 continue
-
-            # Sem tag ativa: detecta início de <tool_call> ou passa conteúdo adiante
-            if '<tool_call>' in buffer:
-                current_tag = 'tool_call'
-                called_tools = True
-                before, after = buffer.split('<tool_call>', 1)
-                if before:
-                    chunk_copy = json.loads(json.dumps(chunk))
-                    chunk_copy["choices"][0]["delta"]["content"] = before
-                    yield chunk_copy
-                buffer = after
-                continue
-
-            # Sem tag: emite conteúdo preservando possíveis prefixos de <tool_call>
-            while buffer:
-                idx = buffer.find('<')
-                if idx > 0:
-                    chunk_copy = json.loads(json.dumps(chunk))
-                    chunk_copy["choices"][0]["delta"]["content"] = buffer[:idx]
-                    yield chunk_copy
-                    buffer = buffer[idx:]
-                elif idx == 0:
-                    if "<tool_call>".startswith(buffer):
-                        break  # prefixo incompleto, aguarda próximo chunk
-                    else:
-                        chunk_copy = json.loads(json.dumps(chunk))
-                        chunk_copy["choices"][0]["delta"]["content"] = "<"
-                        yield chunk_copy
-                        buffer = buffer[1:]
-                else:
-                    chunk_copy = json.loads(json.dumps(chunk))
-                    chunk_copy["choices"][0]["delta"]["content"] = buffer
-                    yield chunk_copy
-                    buffer = ""
-                    break
 
         if called_tools:
-            yield {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": "qwen",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-            }
+            try:
+                final_chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "qwen",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls"
+                        }
+                    ]
+                }
+                if last_usage:
+                    final_chunk["usage"] = last_usage
+                yield final_chunk
+            except:
+                pass

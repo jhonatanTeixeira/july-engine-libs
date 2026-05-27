@@ -66,9 +66,15 @@ async def create_message(request: MessageRequest, http_request: Request):
             first_chunk = True
             first_token_time = None
             completion_tokens = 0
+            # block tracking
+            text_block_open = False
+            tool_blocks: Dict[int, Dict] = {}  # openai_index → {block_index, id, name}
+            current_block_index = -1
+            stop_reason = "end_turn"
             try:
-                yield f"data: {json.dumps({'type': 'message_start', 'message': {'role': 'assistant', 'content': []}})}\n\n"
-                yield f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                msg_id = f"msg_{int(time.time())}"
+                yield f"data: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 1}}})}\n\n"
+                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
 
                 async for chunk in generator:
                     now = time.monotonic()
@@ -77,40 +83,70 @@ async def create_message(request: MessageRequest, http_request: Request):
                         first_token_time = now
                         first_chunk = False
 
-                    if isinstance(chunk, dict):
-                        if "choices" in chunk:
-                            delta = chunk["choices"][0].get("delta", {})
-                            text = delta.get("content") or ""
-                            reasoning = delta.get("reasoning_content") or ""
-
-                            usage = chunk.get("usage")
-                            if usage:
-                                llm_tokens_total.labels(model=model, token_type='prompt').inc(
-                                    usage.get('prompt_tokens', 0)
-                                )
-                                llm_tokens_total.labels(model=model, token_type='completion').inc(
-                                    usage.get('completion_tokens', completion_tokens)
-                                )
-                                completion_tokens = 0
-
-                            if reasoning:
-                                completion_tokens += 1
-                                yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': reasoning}})}\n\n"
-                            if text:
-                                completion_tokens += 1
-                                yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
-                        else:
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                    else:
+                    if not isinstance(chunk, dict) or "choices" not in chunk:
+                        # pass-through (e.g. already-formatted Anthropic chunks)
+                        yield f"data: {json.dumps(chunk) if isinstance(chunk, dict) else json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': str(chunk)}})}\n\n"
                         completion_tokens += 1
-                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': str(chunk)}})}\n\n"
+                        continue
+
+                    delta   = chunk["choices"][0].get("delta", {})
+                    finish  = chunk["choices"][0].get("finish_reason")
+                    text    = delta.get("content") or ""
+                    reasoning = delta.get("reasoning_content") or ""
+
+                    # ── text / reasoning ───────────────────────────────
+                    content_text = reasoning or text
+                    if content_text:
+                        if not text_block_open:
+                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            text_block_open = True
+                            current_block_index = 0
+                        completion_tokens += 1
+                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_text}})}\n\n"
+
+                    # ── tool calls ─────────────────────────────────────
+                    for tc in (delta.get("tool_calls") or []):
+                        oi   = tc.get("index", 0)
+                        func = tc.get("function") or {}
+
+                        if tc.get("id") or func.get("name"):
+                            # new tool block — close whatever is currently open
+                            if current_block_index >= 0:
+                                yield f"data: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+                            bi = (1 if text_block_open else 0) + len(tool_blocks)
+                            tool_blocks[oi] = {
+                                "block_index": bi,
+                                "id": tc.get("id", f"toolu_{int(time.time())}"),
+                                "name": func.get("name", ""),
+                            }
+                            current_block_index = bi
+                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': bi, 'content_block': {'type': 'tool_use', 'id': tool_blocks[oi]['id'], 'name': tool_blocks[oi]['name'], 'input': {}}})}\n\n"
+
+                        if func.get("arguments") and oi in tool_blocks:
+                            yield f"data: {json.dumps({'type': 'content_block_delta', 'index': tool_blocks[oi]['block_index'], 'delta': {'type': 'input_json_delta', 'partial_json': func['arguments']}})}\n\n"
+
+                    # ── usage / finish ─────────────────────────────────
+                    usage = chunk.get("usage")
+                    if usage:
+                        llm_tokens_total.labels(model=model, token_type='prompt').inc(usage.get('prompt_tokens', 0))
+                        llm_tokens_total.labels(model=model, token_type='completion').inc(usage.get('completion_tokens', completion_tokens))
+                        completion_tokens = 0
+
+                    if finish:
+                        if finish == "tool_calls":
+                            stop_reason = "tool_use"
+                        elif finish == "length":
+                            stop_reason = "max_tokens"
+
             finally:
+                if current_block_index >= 0:
+                    yield f"data: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
                 if first_token_time and completion_tokens > 0:
                     elapsed = time.monotonic() - first_token_time
                     if elapsed > 0:
                         llm_tokens_per_second.labels(model=model).observe(completion_tokens / elapsed)
                     llm_tokens_total.labels(model=model, token_type='completion').inc(completion_tokens)
-                yield f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                yield f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': completion_tokens}})}\n\n"
                 yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
                 yield "data: [DONE]\n\n"
 

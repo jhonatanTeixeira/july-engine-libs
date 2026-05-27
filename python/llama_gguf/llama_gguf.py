@@ -541,7 +541,7 @@ class GGUF:
             # or they lose accumulated KV context and cause M-RoPE "Context Shift" errors.
             if not is_reentrant:
                 try:
-                    # slot.reset()
+                    slot.reset()
                     logger.debug("GGUF: Sequence slot KV cache reset (fresh acquisition)")
                 except Exception as e:
                     logger.warning(f"GGUF: Could not reset slot: {e}")
