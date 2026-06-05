@@ -881,3 +881,241 @@ class Qwen35Handler(Qwen35ChatHandler):
                 yield final_chunk
             except:
                 pass
+
+
+class PhiChatHandler(LlamaChatCompletionHandler):
+    """
+    Handler para Phi-4-mini-instruct com suporte a Tool Calling via
+    <|tool_call|>[{"name": "...", "arguments": {...}}]<|/tool_call|>.
+
+    Tokens especiais:
+      <|tool|>...<|/tool|>       — definição de tools no system message (template)
+      <|tool_call|>...<|/tool_call|> — chamada gerada pelo modelo
+      <|tool_response|>...       — resultado da tool (injetado no histórico)
+    """
+
+    TAG_OPEN  = "<|tool_call|>"
+    TAG_CLOSE = "<|/tool_call|>"
+
+    def __init__(self, template: str, eos_token: str = "<|endoftext|>", bos_token: str = "<|endoftext|>"):
+        self.formatter = Jinja2ChatFormatter(
+            template=template,
+            eos_token=eos_token,
+            bos_token=bos_token,
+        )
+        self.handler = self.formatter.to_chat_handler()
+
+    def __call__(self, **kwargs):
+        messages = kwargs.get("messages", [])
+        processed = []
+        for msg in messages:
+            msg = dict(msg)
+
+            # Flatten list content (sem imagens)
+            content = msg.get("content")
+            if isinstance(content, list):
+                has_image = any(
+                    isinstance(p, dict) and p.get("type") in ["image_url", "image"]
+                    for p in content
+                )
+                if not has_image:
+                    msg["content"] = "\n".join(
+                        p.get("text", "") if isinstance(p, dict) and p.get("type") == "text"
+                        else str(p)
+                        for p in content
+                        if (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
+                    )
+
+            # Converte mensagens de resultado de tool para formato Phi
+            if msg.get("role") == "tool":
+                msg = {
+                    "role": "user",
+                    "content": f"<|tool_response|>{msg.get('content', '')}",
+                }
+
+            # Deserializa argumentos de tool_call (template precisa de dict)
+            for tc in msg.get("tool_calls", []):
+                f = tc.get("function", {})
+                if isinstance(f.get("arguments"), str):
+                    try:
+                        f["arguments"] = json.loads(f["arguments"])
+                    except Exception:
+                        pass
+
+            processed.append(msg)
+
+        # Injeta tools no system message no formato que o template Phi espera
+        tools = kwargs.get("tools")
+        if tools:
+            tools_json = json.dumps(tools, ensure_ascii=False)
+            sys_idx = next((i for i, m in enumerate(processed) if m.get("role") == "system"), None)
+            if sys_idx is not None:
+                processed[sys_idx] = dict(processed[sys_idx])
+                processed[sys_idx]["tools"] = tools_json
+            else:
+                processed.insert(0, {"role": "system", "content": "", "tools": tools_json})
+
+        kwargs = dict(kwargs)
+        kwargs["messages"] = processed
+
+        response = self.handler(**kwargs)
+
+        if kwargs.get("stream"):
+            return self._stream_response(response)
+        return self._parse_response(response)
+
+    def _parse_response(self, response):
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "") or ""
+        if not isinstance(content, str):
+            return response
+
+        pattern = re.compile(
+            re.escape(self.TAG_OPEN) + r"(.*?)" + re.escape(self.TAG_CLOSE),
+            re.DOTALL,
+        )
+        parsed_tools = []
+
+        for m in pattern.finditer(content):
+            raw = m.group(1).strip()
+            try:
+                data = json.loads(raw)
+                calls = data if isinstance(data, list) else [data]
+                for call in calls:
+                    parsed_tools.append({
+                        "id": f"call_{uuid.uuid4().hex}",
+                        "type": "function",
+                        "function": {
+                            "name": call.get("name"),
+                            "arguments": (
+                                json.dumps(call.get("arguments", {}))
+                                if isinstance(call.get("arguments"), dict)
+                                else str(call.get("arguments", "{}"))
+                            ),
+                        },
+                    })
+            except Exception as e:
+                logger.warning(f"PhiChatHandler: Failed to parse tool_call: {e} — raw={raw!r}")
+
+        content = pattern.sub("", content).strip() or None
+        message["content"] = content
+        if parsed_tools:
+            message["tool_calls"] = parsed_tools
+            response["choices"][0]["finish_reason"] = "tool_calls"
+
+        return response
+
+    def _stream_response(self, response: Iterator):
+        current_tag = None
+        buffer = ""
+        called_tools = False
+        last_usage = None
+
+        for chunk in response:
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content", "")
+
+            if chunk.get("usage"):
+                last_usage = chunk["usage"]
+
+            if not content:
+                if called_tools:
+                    continue
+                yield chunk
+                continue
+
+            # Suprime conteúdo residual após fechar a tool call
+            if called_tools and not current_tag:
+                continue
+
+            buffer += content
+
+            if not current_tag:
+                if self.TAG_OPEN in buffer:
+                    current_tag = "tool_call"
+                    called_tools = True
+                    before, after = buffer.split(self.TAG_OPEN, 1)
+                    if before.strip():
+                        chunk_copy = json.loads(json.dumps(chunk))
+                        chunk_copy["choices"][0]["delta"]["content"] = before
+                        yield chunk_copy
+                    buffer = after
+                    continue
+
+                # Emissão segura: segura prefixos de tag, emite o restante
+                while buffer:
+                    idx = buffer.find("<")
+                    if idx > 0:
+                        chunk_copy = json.loads(json.dumps(chunk))
+                        chunk_copy["choices"][0]["delta"]["content"] = buffer[:idx]
+                        yield chunk_copy
+                        buffer = buffer[idx:]
+                    elif idx == 0:
+                        if self.TAG_OPEN.startswith(buffer):
+                            break  # Possível início de tag, aguarda próximo chunk
+                        else:
+                            chunk_copy = json.loads(json.dumps(chunk))
+                            chunk_copy["choices"][0]["delta"]["content"] = "<"
+                            yield chunk_copy
+                            buffer = buffer[1:]
+                    else:
+                        chunk_copy = json.loads(json.dumps(chunk))
+                        chunk_copy["choices"][0]["delta"]["content"] = buffer
+                        yield chunk_copy
+                        buffer = ""
+                        break
+                continue
+
+            # Dentro de tool_call: acumula até a tag de fechamento
+            if current_tag == "tool_call":
+                if self.TAG_CLOSE in buffer:
+                    raw_json, rest = buffer.split(self.TAG_CLOSE, 1)
+                    try:
+                        clean = re.sub(r"```json\s*|\s*```", "", raw_json).strip()
+                        data = json.loads(clean)
+                        calls = data if isinstance(data, list) else [data]
+                        for call in calls:
+                            uid = uuid.uuid4().hex[:10]
+                            chunk_head = json.loads(json.dumps(chunk))
+                            chunk_head["choices"][0]["delta"].pop("content", None)
+                            chunk_head["choices"][0]["delta"].pop("reasoning_content", None)
+                            chunk_head["choices"][0]["delta"]["tool_calls"] = [{
+                                "index": 0, "id": f"call_{uid}", "type": "function",
+                                "function": {"name": call.get("name")},
+                            }]
+                            yield chunk_head
+
+                            chunk_args = json.loads(json.dumps(chunk))
+                            chunk_args["choices"][0]["delta"].pop("content", None)
+                            chunk_args["choices"][0]["delta"].pop("reasoning_content", None)
+                            chunk_args["choices"][0]["delta"]["tool_calls"] = [{
+                                "index": 0, "id": f"call_{uid}",
+                                "function": {"arguments": json.dumps(call.get("arguments", {}))},
+                            }]
+                            yield chunk_args
+                    except Exception as e:
+                        logger.warning(f"PhiChatHandler: stream parse error: {e}")
+
+                    buffer = rest
+                    current_tag = None
+                    continue
+
+                if len(buffer) > 4000:
+                    logger.warning("PhiChatHandler: tool_call buffer overflow, clearing")
+                    buffer = ""
+                continue
+
+        if called_tools:
+            try:
+                final = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "phi",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                }
+                if last_usage:
+                    final["usage"] = last_usage
+                yield final
+            except:
+                pass

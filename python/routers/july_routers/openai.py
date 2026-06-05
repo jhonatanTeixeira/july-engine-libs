@@ -88,13 +88,6 @@ class ImageGenerationRequest(BaseModel):
     size: Optional[str] = None
     response_format: Optional[str] = "b64_json"
 
-class VideoGenerationRequest(BaseModel):
-    prompt: str
-    model: Optional[str] = None
-    duration: Optional[int] = None
-    size: Optional[str] = None
-    response_format: Optional[str] = "b64_json"
-
 # --- Response DTOs for Swagger Documentation ---
 
 class ChatCompletionResponse(BaseModel):
@@ -287,13 +280,3 @@ async def create_image_resize(payload: dict, http_request: Request):
     headers = dict(http_request.headers)
     result = await bridge.process_image_resize(payload, headers)
     return {"image": result}
-
-@router.post("/videos/generations", response_model=ImageResponse)
-async def create_video_generation(request: VideoGenerationRequest, http_request: Request):
-    headers = dict(http_request.headers)
-    payload = request.model_dump()
-    result = await bridge.process_video_generation(payload, headers)
-    return {
-        "created": int(time.time()),
-        "data": [{"b64_json": result}]
-    }
