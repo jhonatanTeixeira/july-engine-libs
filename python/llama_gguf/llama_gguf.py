@@ -522,7 +522,8 @@ class GGUF:
             except ValueError:
                 pass
 
-        self.load(n_ctx, kwargs.pop('num_layers', None))
+        import asyncio
+        await asyncio.to_thread(self.load, n_ctx, kwargs.pop('num_layers', None))
 
         if "repetition_penalty" in kwargs:
             kwargs["repeat_penalty"] = kwargs.pop("repetition_penalty")
@@ -556,7 +557,9 @@ class GGUF:
                     logger.warning(f"GGUF: Could not reset slot: {e}")
 
             try:
-                response = slot.create_chat_completion(
+                import asyncio
+                response = await asyncio.to_thread(
+                    slot.create_chat_completion,
                     messages,
                     stream=stream,
                     **kwargs
@@ -588,7 +591,12 @@ class GGUF:
                             buffer = ""
                             raw_response = ""
                             
-                            for chunk in response:
+                            import asyncio
+                            while True:
+                                try:
+                                    chunk = await asyncio.to_thread(next, response)
+                                except StopIteration:
+                                    break
                                 delta = chunk["choices"][0].get("delta", {})
                                 
                                 finish_reason = chunk["choices"][0].get("finish_reason")
