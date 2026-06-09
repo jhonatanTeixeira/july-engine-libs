@@ -58,12 +58,14 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     tools: Optional[List[ToolDefinition]] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
+    response_format: Optional[Dict[str, Any]] = None
     
     # Allow extra fields for num_ctx or others (from extra_body)
     model_config = {"extra": "allow"}

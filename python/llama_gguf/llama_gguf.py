@@ -532,7 +532,16 @@ class GGUF:
         kwargs.pop("reasoning_enabled", None)
         kwargs.pop("reasoning_effort", None)
         
+        # FIX: Se response_format for json_object, repeat_penalty DEVE ser 1.0
+        # Caso contrário o llama.cpp penaliza os caracteres da gramática JSON e entra em loop de espaços
+        fmt = kwargs.get("response_format")
+        if isinstance(fmt, dict) and fmt.get("type") == "json_object":
+            kwargs["repeat_penalty"] = 1.0
+        
         force_reasoning = self.meta.get("force_reasoning", False)
+
+        if "max_completion_tokens" in kwargs:
+            kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
 
         if "max_tokens" not in kwargs:
             kwargs["max_tokens"] = -1
@@ -555,6 +564,8 @@ class GGUF:
                     logger.debug("GGUF: Sequence slot KV cache reset (fresh acquisition)")
                 except Exception as e:
                     logger.warning(f"GGUF: Could not reset slot: {e}")
+
+            logger.debug(f"GGUF chat call, {({'stream': stream, **kwargs})}")
 
             try:
                 import asyncio
@@ -593,9 +604,8 @@ class GGUF:
                             
                             import asyncio
                             while True:
-                                try:
-                                    chunk = await asyncio.to_thread(next, response)
-                                except StopIteration:
+                                chunk = await asyncio.to_thread(next, response, None)
+                                if chunk is None:
                                     break
                                 delta = chunk["choices"][0].get("delta", {})
                                 
