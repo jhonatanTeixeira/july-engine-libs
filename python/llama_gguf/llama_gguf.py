@@ -454,11 +454,8 @@ class GGUF:
                 # Phi Tool Calling Support (non-VL)
                 if re.search(r'phi', model_identifier.lower()) and meta.get("model_type") != "vision":
                     from .chat_handlers import PhiChatHandler
-                    template = self.model_metadata.tokenizer_template or meta.get("template")
-                    if isinstance(template, str) and template.strip():
-                        base_params["chat_handler"] = PhiChatHandler(template=template)
-                        if "chat_format" in base_params:
-                            del base_params["chat_format"]
+                    base_params["chat_handler"] = PhiChatHandler()
+                    base_params.pop("chat_format", None)
                 
                 if meta.get("model_type") == "vision":
                     mmproj_path = None

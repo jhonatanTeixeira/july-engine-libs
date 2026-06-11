@@ -883,25 +883,80 @@ class Qwen35Handler(Qwen35ChatHandler):
                 pass
 
 
+_PHI4_CHAT_TEMPLATE = (
+    # System block (com tools opcionais embutidas)
+    "{%- if messages[0]['role'] == 'system' -%}"
+        "<|system|>{{ messages[0]['content'] or '' }}"
+        "{%- if 'tools' in messages[0] and messages[0]['tools'] is not none -%}"
+            "<|tool|>{{ messages[0]['tools'] }}<|/tool|>"
+        "{%- endif -%}"
+        "<|end|>"
+    "{%- else -%}"
+        "<|system|><|end|>"
+    "{%- endif -%}"
+    # Turns
+    "{%- for message in messages -%}"
+        "{%- if message['role'] == 'system' -%}"
+        # Assistant: reconstrói reasoning + tool_call se existirem
+        "{%- elif message['role'] == 'assistant' -%}"
+            "{%- set content = message['content'] or '' -%}"
+            "{%- set reasoning_content = '' -%}"
+            "{%- if message.reasoning_content is string -%}"
+                "{%- set reasoning_content = message.reasoning_content -%}"
+            "{%- elif '</think>' in content -%}"
+                "{%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') -%}"
+                "{%- set content = content.split('</think>')[-1].lstrip('\n') -%}"
+            "{%- endif -%}"
+            "{%- set reasoning_content = reasoning_content | trim -%}"
+            "{%- if message.tool_calls -%}"
+                "{%- set ns = namespace(calls=[]) -%}"
+                "{%- for tc in message.tool_calls -%}"
+                    "{%- set ns.calls = ns.calls + [{'name': tc.function.name, 'arguments': tc.function.arguments}] -%}"
+                "{%- endfor -%}"
+                "{%- if reasoning_content -%}"
+                    "<|assistant|><think>\n{{ reasoning_content }}\n</think>\n\n{{ content }}<|tool_call|>{{ ns.calls | tojson }}<|/tool_call|><|end|>"
+                "{%- else -%}"
+                    "<|assistant|>{{ content }}<|tool_call|>{{ ns.calls | tojson }}<|/tool_call|><|end|>"
+                "{%- endif -%}"
+            "{%- elif reasoning_content -%}"
+                "<|assistant|><think>\n{{ reasoning_content }}\n</think>\n\n{{ content }}<|end|>"
+            "{%- else -%}"
+                "<|assistant|>{{ content }}<|end|>"
+            "{%- endif -%}"
+        # Tool response: <|tool_response|>...<|end|>
+        "{%- elif message['role'] == 'tool' -%}"
+            "<|tool_response|>{{ message['content'] or '' }}<|end|>"
+        # User e demais roles
+        "{%- else -%}"
+            "<|{{ message['role'] }}|>{{ message['content'] or '' }}<|end|>"
+        "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}<|assistant|>{%- else -%}{{ eos_token }}{%- endif -%}"
+)
+
+
 class PhiChatHandler(LlamaChatCompletionHandler):
     """
     Handler para Phi-4-mini-instruct com suporte a Tool Calling via
     <|tool_call|>[{"name": "...", "arguments": {...}}]<|/tool_call|>.
 
     Tokens especiais:
-      <|tool|>...<|/tool|>       — definição de tools no system message (template)
-      <|tool_call|>...<|/tool_call|> — chamada gerada pelo modelo
-      <|tool_response|>...       — resultado da tool (injetado no histórico)
+      <|system|>...<|end|>            — system message
+      <|tool|>...<|/tool|>            — definição de tools (dentro do system)
+      <|user|>...<|end|>              — turno do usuário
+      <|assistant|>...<|end|>         — turno do assistente
+      <|tool_call|>...<|/tool_call|>  — chamada de tool gerada pelo modelo
+      <|tool_response|>...<|end|>     — resultado da tool
     """
 
     TAG_OPEN  = "<|tool_call|>"
     TAG_CLOSE = "<|/tool_call|>"
 
-    def __init__(self, template: str, eos_token: str = "<|endoftext|>", bos_token: str = "<|endoftext|>"):
+    def __init__(self):
         self.formatter = Jinja2ChatFormatter(
-            template=template,
-            eos_token=eos_token,
-            bos_token=bos_token,
+            template=_PHI4_CHAT_TEMPLATE,
+            eos_token="<|end|>",
+            bos_token="<|endoftext|>",
         )
         self.handler = self.formatter.to_chat_handler()
 
@@ -911,7 +966,6 @@ class PhiChatHandler(LlamaChatCompletionHandler):
         for msg in messages:
             msg = dict(msg)
 
-            # Flatten list content (sem imagens)
             content = msg.get("content")
             if isinstance(content, list):
                 has_image = any(
@@ -926,25 +980,25 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                         if (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
                     )
 
-            # Converte mensagens de resultado de tool para formato Phi
-            if msg.get("role") == "tool":
-                msg = {
-                    "role": "user",
-                    "content": f"<|tool_response|>{msg.get('content', '')}",
-                }
-
-            # Deserializa argumentos de tool_call (template precisa de dict)
-            for tc in msg.get("tool_calls", []):
-                f = tc.get("function", {})
-                if isinstance(f.get("arguments"), str):
-                    try:
-                        f["arguments"] = json.loads(f["arguments"])
-                    except Exception:
-                        pass
+            # Deep copy tool_calls para não mutar o payload original,
+            # e desserializa arguments string → dict para o template Jinja poder usar tojson
+            if msg.get("tool_calls"):
+                new_tcs = []
+                for tc in msg["tool_calls"]:
+                    tc = dict(tc)
+                    if "function" in tc:
+                        fn = dict(tc["function"])
+                        if isinstance(fn.get("arguments"), str):
+                            try:
+                                fn["arguments"] = json.loads(fn["arguments"])
+                            except Exception:
+                                pass
+                        tc["function"] = fn
+                    new_tcs.append(tc)
+                msg["tool_calls"] = new_tcs
 
             processed.append(msg)
 
-        # Injeta tools no system message no formato que o template Phi espera
         tools = kwargs.get("tools")
         if tools:
             tools_json = json.dumps(tools, ensure_ascii=False)
@@ -1010,8 +1064,10 @@ class PhiChatHandler(LlamaChatCompletionHandler):
         buffer = ""
         called_tools = False
         last_usage = None
+        last_chunk = None
 
         for chunk in response:
+            last_chunk = chunk
             delta = chunk.get("choices", [{}])[0].get("delta", {})
             content = delta.get("content", "")
 
@@ -1104,6 +1160,13 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                     logger.warning("PhiChatHandler: tool_call buffer overflow, clearing")
                     buffer = ""
                 continue
+
+        # Flush do buffer residual (conteúdo retido para detecção de tag)
+        if buffer and not called_tools and last_chunk is not None:
+            chunk_copy = json.loads(json.dumps(last_chunk))
+            chunk_copy["choices"][0]["delta"] = {"content": buffer}
+            chunk_copy["choices"][0]["finish_reason"] = None
+            yield chunk_copy
 
         if called_tools:
             try:

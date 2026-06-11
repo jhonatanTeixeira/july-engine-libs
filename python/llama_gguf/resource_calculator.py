@@ -49,11 +49,11 @@ class ModelMetadata:
                     if hasattr(part, "tolist"): val = part.tolist()
                     elif isinstance(part, bytes): val = part.decode('utf-8', errors='ignore').strip('\x00')
                     else: val = part
-                    
+
                     if isinstance(val, list) and len(val) == 1: val = val[0]
                     if isinstance(val, (int, float, str, bool)):
                         self.data[name] = val
-            
+
             with open(self.cache_file, 'w') as f:
                 json.dump(self.data, f, indent=4)
         except Exception as e:
