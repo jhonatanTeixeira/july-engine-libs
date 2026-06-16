@@ -24,6 +24,13 @@ class WebSearchRequest(BaseModel):
     describe_model: Optional[str] = None
 
 
+class ScrapeUrlsRequest(BaseModel):
+    urls: List[str]
+    query: str
+    context_window: Optional[int] = None
+    model: Optional[str] = None
+
+
 @router.post("/web", tags=["July"])
 async def search_web(request: Request, payload: WebSearchRequest):
     headers = dict(request.headers)
@@ -60,6 +67,20 @@ async def search_and_scrape(request: Request, payload: WebSearchRequest):
         describe_model=payload.describe_model
     )
     
+    return {"result": result}
+
+
+@router.post("/scrape-urls", tags=["July"])
+async def scrape_urls(request: Request, payload: ScrapeUrlsRequest):
+    """Raspa uma lista de URLs e sumariza via LLM com chunking por janela de contexto."""
+    headers = dict(request.headers)
+    result = await bridge.process_scrape_and_summarize(
+        payload.urls,
+        payload.query,
+        headers,
+        context_window=payload.context_window,
+        model=payload.model,
+    )
     return {"result": result}
 
 

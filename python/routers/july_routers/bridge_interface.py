@@ -84,6 +84,9 @@ class BridgeInterface:
     async def process_search_and_scrape(self, results: list, query: str, headers: dict, describe_model: str = None):
         raise NotImplementedError
 
+    async def process_scrape_and_summarize(self, urls: list, query: str, headers: dict, context_window: int = None, model: str = None):
+        raise NotImplementedError
+
     async def process_resource_check(self, payload: dict):
         raise NotImplementedError
 
