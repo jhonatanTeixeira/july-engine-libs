@@ -19,6 +19,10 @@ _CTX_OVERFLOW_PHRASES = (
     "Context Shift is explicitly disabled",
     "Context shift failed",
     "Context Shift failed",
+    # llama_decode returns -1 when the tokenized prompt exceeds n_ctx
+    "exceeding capacity",
+    "llama_decode failed (code -1): Invalid input batch",
+    "Fatal Decode Error at Pos 0, Batch size",
 )
 
 def _is_ctx_overflow(exc: BaseException) -> bool:
