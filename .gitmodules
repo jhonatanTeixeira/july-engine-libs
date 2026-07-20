@@ -1,0 +1,4 @@
+[submodule "python/llama_gguf/vendor/llama-cpp-python"]
+	path = python/llama_gguf/vendor/llama-cpp-python
+	url = https://github.com/jhonatanTeixeira/llama-cpp-python.git
+	branch = master
