@@ -7,8 +7,8 @@ import time
 import uuid
 import threading
 import copy
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from .resource_calculator import estimate_vram_ram, ModelMetadata
 from .context import request_id_var, acquired_instances_var
 
@@ -43,7 +43,7 @@ def get_gguf_load_lock(model_path: str):
 
 def detect_model_capabilities(repo_id_or_filename: str) -> dict:
     """
-    Usa RegEx para mapear o modelo para os Handlers específicos do fork JamePeng.
+    Uses regex to map the model to the specific handlers from the JamePeng fork.
     """
     name = repo_id_or_filename.lower()
     capabilities = {
@@ -52,7 +52,7 @@ def detect_model_capabilities(repo_id_or_filename: str) -> dict:
     }
 
     # ==========================================
-    # 1. DETECÇÃO DO CHAT FORMAT FALLBACK
+    # 1. CHAT FORMAT FALLBACK DETECTION
     # ==========================================
     if re.search(r"qwen[_\-\.]?(?:2\.5|3|4)", name):
         capabilities["chat_format"] = "chatml"
@@ -64,7 +64,7 @@ def detect_model_capabilities(repo_id_or_filename: str) -> dict:
         capabilities["chat_format"] = "mistral-instruct"
 
     # ==========================================
-    # 2. DETECÇÃO DE VISÃO (JAMEPENG HANDLERS)
+    # 2. VISION DETECTION (JAMEPENG HANDLERS)
     # ==========================================
     if re.search(r"gemma[_\-\.]?4", name):
         capabilities["vision_handler"] = "gemma4"
@@ -91,13 +91,14 @@ def detect_model_capabilities(repo_id_or_filename: str) -> dict:
 
 class SeqAllocator:
     """
-    Aloca seq_ids livres para requests, com afinidade de KV cache por conversation_id.
+    Allocates free seq_ids for requests, with KV cache affinity by conversation_id.
 
-    NÃO faz nenhuma chamada nativa ao llama.cpp — é só bookkeeping de "qual seq_id está
-    livre" e "qual conversation_id cada seq_id guarda atualmente". A exclusão mútua sobre
-    as chamadas nativas em si é garantida por outro mecanismo: o `DecodeGate` é o ÚNICO
-    ponto que chama a Llama compartilhada, então não existe mais nada aqui que precise
-    de lock por slot.
+    Does NOT make any native call into llama.cpp — it's just bookkeeping of "which
+    seq_id is free" and "which conversation_id each seq_id currently holds". Mutual
+    exclusion over the native calls themselves is guaranteed by a different mechanism:
+    `model.decode_gate` (from the llama-cpp-python fork itself) is the ONLY point that
+    calls into the shared Llama instance, so there's nothing left here that needs a
+    per-slot lock.
     """
 
     def __init__(self, n_seq_max: int):
@@ -105,22 +106,22 @@ class SeqAllocator:
         self._available: "asyncio.Queue[int]" = asyncio.Queue()
         self._allocated: set = set()
         self._pool_lock = asyncio.Lock()
-        # qual conversation_id cada seq_id está segurando (KV cache) no momento
+        # which conversation_id each seq_id is currently holding (KV cache)
         self.seq_conversation: Dict[int, Optional[str]] = {}
         for i in range(n_seq_max):
             self._available.put_nowait(i)
             self.seq_conversation[i] = None
 
     async def acquire(self, conversation_id: Optional[str] = None) -> "tuple[int, bool]":
-        """Adquire um seq_id livre, com suporte a re-entrância por request_id.
+        """Acquires a free seq_id, with support for re-entrancy by request_id.
 
-        Retorna (seq_id, is_new_conversation).
-        - is_new_conversation=False → reentrância (mesma request HTTP) OU o seq_id já
-          guardava o KV cache dessa exata conversation_id — NÃO resetar, deixar o próprio
-          generate() reaproveitar o prefixo do KV cache automaticamente.
-        - is_new_conversation=True  → esse seq_id está trocando de dono (conversa
-          diferente da que ele guardava antes, ou nunca guardou nenhuma) — o chamador deve
-          fazer um reset explícito antes de gerar.
+        Returns (seq_id, is_new_conversation).
+        - is_new_conversation=False → re-entrancy (same HTTP request) OR the seq_id
+          already held the KV cache for this exact conversation_id — do NOT reset,
+          let generate() itself reuse the KV cache prefix automatically.
+        - is_new_conversation=True  → this seq_id is changing owners (a different
+          conversation than the one it held before, or it never held any) — the
+          caller must do an explicit reset before generating.
         """
         rid = request_id_var.get()
 
@@ -128,10 +129,10 @@ class SeqAllocator:
             if rid:
                 acquired = acquired_instances_var.get()
                 if self in acquired:
-                    # Re-entrância: Esta request já reservou uma seq deste pool
+                    # Re-entrancy: this request has already reserved a seq from this pool
                     return acquired[self], False
 
-            # Tenta achar o seq_id que já guarda o KV cache dessa conversation_id
+            # Try to find the seq_id that already holds the KV cache for this conversation_id
             if conversation_id:
                 preferred = next(
                     (s for s, c in self.seq_conversation.items() if c == conversation_id),
@@ -159,9 +160,9 @@ class SeqAllocator:
                             acquired[self] = found
                             acquired_instances_var.set(acquired)
                         return found, False
-                    # Slot preferido ocupado agora — cai pra espera normal abaixo
+                    # Preferred slot taken now — fall through to the normal wait below
 
-        # Espera por uma seq livre (fora do _pool_lock para não bloquear releases)
+        # Wait for a free seq (outside _pool_lock so releases aren't blocked)
         seq = await self._available.get()
 
         async with self._pool_lock:
@@ -176,27 +177,27 @@ class SeqAllocator:
         return seq, is_new_conversation
 
     def release(self, seq_id: int):
-        """Libera a seq, a menos que esteja reservada para re-entrância."""
+        """Releases the seq, unless it's reserved for re-entrancy."""
         rid = request_id_var.get()
         if rid:
-            # Em requests HTTP rastreadas, não liberamos imediatamente pois o
-            # segundo turno pode precisar da mesma instância.
-            # A liberação real ocorrerá no Middleware ao fim da request.
+            # In tracked HTTP requests, we don't release immediately because the
+            # second turn may need the same instance.
+            # The actual release happens in the Middleware at the end of the request.
             return
         self._real_release(seq_id)
 
     def _real_release(self, seq_id: int):
-        """Põe a seq de volta na fila de disponibilidade (mantém a afinidade de conversa)."""
+        """Puts the seq back in the availability queue (keeps conversation affinity)."""
         if seq_id in self._allocated:
             self._allocated.remove(seq_id)
             self._available.put_nowait(seq_id)
 
     def _force_release(self, seq_id: int):
-        """Força a liberação ignorando o request_id (usado pelo middleware)."""
+        """Forces the release, ignoring request_id (used by the middleware)."""
         self._real_release(seq_id)
 
     def stop(self):
-        """Para o alocador e limpa referências para permitir coleta de lixo."""
+        """Stops the allocator and clears references to allow garbage collection."""
         self._available = asyncio.Queue()
         self._allocated.clear()
         self.seq_conversation.clear()
@@ -205,109 +206,9 @@ class SeqAllocator:
 _SENTINEL = object()
 
 
-@dataclass
-class DecodeRequest:
-    """Um pedido de decode: adicionar `tokens` ao KV cache do `seq_id`, a partir da
-    posição `pos`, e devolver o índice de logits do ÚLTIMO token (pra amostrar o próximo
-    token dessa sessão). Prefill (muitos tokens) e geração em regime estacionário (1
-    token) usam a MESMA classe — só varia o tamanho de `tokens`; é a mesma operação."""
-    seq_id: int
-    tokens: List[int]
-    pos: int
-    result_idx: int = -1
-    error: Optional[BaseException] = None
-    event: "asyncio.Event" = field(default_factory=asyncio.Event)
-
-
-class DecodeGate:
-    """
-    Único ponto de exclusão mútua por instância `GGUF` sobre chamadas nativas de
-    `decode()`. Substitui o antigo `GGUFDispatcher` (round-robin, 1 `decode()` por sessão
-    por rodada) por fila + eleição de líder: quem chega e acha a fila livre vira líder,
-    drena TUDO que estiver esperando naquele instante (não só quem chegou primeiro),
-    monta um `LlamaBatch` com as contribuições de todos, decodifica UMA VEZ, distribui os
-    resultados, então recheca a fila antes de largar a liderança. Sem espera artificial —
-    o líder processa imediatamente quem já estiver esperando, seja 1 ou N pedidos.
-
-    Prefill e geração em regime estacionário passam pela MESMA fila/mecanismo — não são
-    dois caminhos diferentes. Isso evita por construção o bug (encontrado num protótipo
-    anterior) de reamostrar o último token do prompt numa posição nova pra "encaixar" num
-    modelo de rodada: aqui não existe rodada, só "submeta tokens, peça logits do último".
-
-    `run_exclusive_step()` adquire a MESMA exclusão mútua pra rodar uma função síncrona
-    arbitrária (usada pelo caminho de fallback — mensagens com mídia de verdade, ou
-    handlers que não sabemos decompor com segurança — que reaproveita
-    `create_chat_completion()` inteiro, um passo por vez, exatamente como o dispatcher
-    round-robin antigo fazia). Garante que essas chamadas NUNCA corram ao mesmo tempo que
-    uma rodada batchada de outra sessão — só existe UM lock por instância de modelo.
-    """
-
-    def __init__(self, model):
-        self.model = model
-        self._pending: List[DecodeRequest] = []
-        self._lock = asyncio.Lock()
-
-    async def submit(self, req: DecodeRequest) -> int:
-        self._pending.append(req)
-        async with self._lock:
-            # Pode ser que, enquanto esperávamos o lock, um líder anterior já tenha
-            # drenado a fila e processado este pedido — não reprocessar.
-            if not req.event.is_set():
-                await self._drain_and_decode()
-        if req.error is not None:
-            raise req.error
-        return req.result_idx
-
-    async def run_exclusive_step(self, fn):
-        """Roda `fn()` (síncrono, sem argumentos) com exclusividade total sobre o
-        modelo — nenhuma outra sessão (batchada ou não) decodifica enquanto isso."""
-        async with self._lock:
-            return fn()
-
-    async def _drain_and_decode(self):
-        if not self._pending:
-            return
-        batch_reqs, self._pending = self._pending, []
-
-        from llama_cpp.llama import active_seq_id
-
-        try:
-            batch = self.model._batch
-            batch.reset()
-            batch_pos = 0  # posição BRUTA no batch — get_logits_ith() espera a posição
-                            # real, não um contador compactado de quantos pedidos passaram
-            for r in batch_reqs:
-                active_seq_id.set(r.seq_id)
-                pos = r.pos
-                last_i = len(r.tokens) - 1
-                for i, tok in enumerate(r.tokens):
-                    is_last = (i == last_i)
-                    batch.add_token(tok, pos, [r.seq_id], is_last)
-                    pos += 1
-                    if is_last:
-                        r.result_idx = batch_pos
-                    batch_pos += 1
-
-            ret = self.model._ctx.decode(batch)
-            if ret != 0:
-                raise RuntimeError(f"llama_decode retornou {ret} (sem slot de KV cache disponível)")
-        except Exception as e:
-            for r in batch_reqs:
-                r.error = e
-
-        for r in batch_reqs:
-            r.event.set()
-
-        # Cede o controle pro event loop mesmo sem contenção no lock — um `asyncio.Lock`
-        # descontendido não suspende sozinho, então sem isso uma sessão gerando muitos
-        # tokens em sequência (sem nenhuma outra sessão concorrente) nunca devolveria o
-        # controle pro event loop, travando outras rotas do FastAPI até ela terminar.
-        await asyncio.sleep(0)
-
-
 def _accumulate_tool_call_deltas(acc: List[dict], delta_tool_calls: List[dict]):
-    """Acumula deltas de tool_calls no formato de streaming da OpenAI (por índice,
-    arguments chega fragmentado e precisa ser concatenado)."""
+    """Accumulates tool_call deltas in OpenAI's streaming format (by index; arguments
+    arrive fragmented and need to be concatenated)."""
     for tc in delta_tool_calls:
         idx = tc.get("index", 0)
         while len(acc) <= idx:
@@ -328,10 +229,10 @@ _NAMED_FORMATTERS: Optional[Dict[str, Any]] = None
 
 
 def _get_named_formatter(chat_format: Optional[str]):
-    """Formatos nomeados (chatml/llama-2/llama-3/mistral-instruct/gemma) não ficam
-    guardados em nenhum registro público como `ChatFormatter` cru — só como handler já
-    empacotado (`LlamaChatCompletionHandlerRegistry`). As funções puras continuam
-    acessíveis diretamente pelo nome no módulo, então mapeamos manualmente aqui."""
+    """Named formats (chatml/llama-2/llama-3/mistral-instruct/gemma) aren't kept in any
+    public registry as a raw `ChatFormatter` — only as an already-packaged handler
+    (`LlamaChatCompletionHandlerRegistry`). The pure functions are still accessible
+    directly by name in the module, so we map them manually here."""
     global _NAMED_FORMATTERS
     if _NAMED_FORMATTERS is None:
         from llama_cpp import llama_chat_format
@@ -347,62 +248,69 @@ def _get_named_formatter(chat_format: Optional[str]):
 
 @dataclass
 class PreparedGeneration:
-    """Resultado de `_prepare_session`: tudo que é necessário pra gerar via `DecodeGate`
-    sem precisar chamar `create_chat_completion()` (que geraria de forma não-batchável).
-    `post_handler`, quando presente, precisa ter seu `_parse_response(response)` chamado
-    no texto final montado (ver `_run_batched_generation_collect`), preservando o parsing
-    de tool_call/reasoning que os handlers Qwen/Phi/MTMD já fazem hoje."""
+    """Result of `_prepare_session`: everything needed to generate via `DecodeGate`
+    without calling `create_chat_completion()` (which would generate in a non-batchable
+    way). `post_handler`, when present, needs its `_parse_response(response)` called on
+    the final assembled text (see `_run_batched_generation_collect`), preserving the
+    tool_call/reasoning parsing that the Qwen/Phi/MTMD handlers already do today."""
     prompt_tokens: List[int]
     stop: List[str]
     stopping_criteria: Optional[Any]
     grammar_str: str
     post_handler: Optional[Any]
     messages_norm: List[Dict[str, Any]]
+    # Only populated when the message has real media addressed to an MTMD handler
+    # — see `_mtmd_prefill`. `mtmd_chunks`/`mtmd_bitmap_cleanup` stay alive (not freed
+    # by `_prepare_session`) until the prefill finishes processing them.
+    mtmd_handler: Optional[Any] = None
+    mtmd_chunk_spans: Optional[List[Tuple[int, int, Any, int, Optional[int]]]] = None
+    mtmd_chunks: Optional[Any] = None
+    mtmd_bitmap_cleanup: Optional[List[Any]] = None
 
 
 def _prepare_session(llm, messages: List[Dict[str, Any]], **kwargs) -> Optional[PreparedGeneration]:
     """
-    Resolve o `ChatFormatter` certo pro handler/formato configurado em `llm` (a instância
-    `Llama`) e monta tudo que é necessário pra gerar via `DecodeGate` (tokens, stop,
-    stopping_criteria, grammar) — sem chamar geração nenhuma. Espelha a lógica de
-    `chat_formatter_to_chat_completion_handler` (que faz render+tokenize+grammar antes de
-    gerar de verdade), só que parando antes do `create_completion()`.
+    Resolves the right `ChatFormatter` for the handler/format configured on `llm` (the
+    `Llama` instance) and builds everything needed to generate via `DecodeGate` (tokens,
+    stop, stopping_criteria, grammar) — without triggering any generation. Mirrors the
+    logic of `chat_formatter_to_chat_completion_handler` (which does render+tokenize+
+    grammar before actually generating), just stopping before `create_completion()`.
 
-    Recebe `**kwargs` (o payload da request, que inclui uma chave `model` com o ALIAS do
-    modelo, não a instância — daí o parâmetro se chamar `llm`, não `model`, evitando
-    colisão).
+    Receives `**kwargs` (the request payload, which includes a `model` key holding the
+    model ALIAS, not the instance — hence the parameter is named `llm`, not `model`, to
+    avoid a collision).
 
-    Devolve `None` se não souber decompor esse handler/mensagem com segurança — quem
-    chama deve cair no caminho de fallback (`DecodeGate.run_exclusive_step` +
-    `create_chat_completion()` inteiro, igual o dispatcher round-robin antigo fazia):
-    - mensagem com mídia de verdade endereçada a um handler MTMD (Gemma4/Qwen3.5-vision/
-      etc.) — o `__call__` desses handlers sempre muta o KV cache inline como parte do
-      preparo do prompt, não é separável;
-    - qualquer `chat_handler` customizado sem um jeito conhecido de extrair só o prompt
-      (não é Qwen/Phi nem MTMD);
-    - `chat_format` sem formatter resolvível (nem em `llm._chat_formatters`, nem um dos
-      formatos nomeados conhecidos) — o mesmo caso que já falharia hoje.
+    Returns `None` if it can't safely decompose this handler/message — the caller should
+    fall back to the fallback path (`model.decode_gate.run_exclusive` +
+    `create_chat_completion()` in full, same as the old round-robin dispatcher did):
+    - any custom `chat_handler` without a known way to extract just the prompt (not
+      Qwen/Phi nor MTMD);
+    - a `chat_format` with no resolvable formatter (neither in `llm._chat_formatters`
+      nor one of the known named formats) — the same case that would already fail today.
+
+    Messages with real media addressed to an MTMD handler (Gemma4/Qwen3.5-vision/etc.)
+    no longer fall back — `mtmd_chunk_spans`/`mtmd_chunks`/`mtmd_bitmap_cleanup` get
+    populated, and the caller must process the prefill chunk by chunk via
+    `_mtmd_prefill` (text batchable in `model.decode_gate`, media encoded under a
+    separate lock — see that function for details).
     """
     from llama_cpp.llama_chat_format import MTMDChatHandler
 
     chat_handler = getattr(llm, "chat_handler", None)
     formatter = None
     post_handler = None
-    is_mtmd_no_media = False
+    is_mtmd = False
 
     if chat_handler is not None:
         if isinstance(chat_handler, MTMDChatHandler):
-            media = chat_handler._get_media_items(messages)
-            if media:
-                return None  # mídia de verdade: precisa do __call__ completo (fallback)
-            is_mtmd_no_media = True
+            is_mtmd = True
             post_handler = chat_handler
         elif callable(getattr(chat_handler, "formatter", None)):
-            # Convenção Qwen/PhiChatHandler: self.formatter é o ChatFormatter puro
+            # Qwen/PhiChatHandler convention: self.formatter is the raw ChatFormatter
             formatter = chat_handler.formatter
             post_handler = chat_handler
         else:
-            return None  # handler customizado desconhecido: fallback
+            return None  # unknown custom handler: fallback
     else:
         chat_format = getattr(llm, "chat_format", None)
         formatter = llm._chat_formatters.get(chat_format) or _get_named_formatter(chat_format)
@@ -423,10 +331,13 @@ def _prepare_session(llm, messages: List[Dict[str, Any]], **kwargs) -> Optional[
     from .chat_handlers import _flatten_and_normalize_messages
     messages_norm = _flatten_and_normalize_messages(messages)
     stopping_criteria = None
+    mtmd_chunk_spans = None
+    mtmd_chunks = None
+    mtmd_bitmap_cleanup = None
 
-    if is_mtmd_no_media:
+    if is_mtmd:
         chat_handler._init_mtmd_context(llm)
-        full_prompt_ids, _spans, chunks, bitmap_cleanup = chat_handler._process_mtmd_prompt(
+        full_prompt_ids, chunk_spans, chunks, bitmap_cleanup = chat_handler._process_mtmd_prompt(
             llama=llm,
             messages=messages_norm,
             functions=functions,
@@ -435,13 +346,24 @@ def _prepare_session(llm, messages: List[Dict[str, Any]], **kwargs) -> Optional[
             tool_choice=tool_choice,
             add_generation_prompt=True,
         )
-        # Sem mídia, não há nada pra reter — libera os recursos C imediatamente (mesma
-        # limpeza que o __call__ do handler faz no seu próprio bloco finally).
-        if chunks is not None:
-            chat_handler._mtmd_cpp.mtmd_input_chunks_free(chunks)
-        if bitmap_cleanup:
-            for bitmap in bitmap_cleanup:
-                chat_handler._mtmd_cpp.mtmd_bitmap_free(bitmap)
+        has_media = any(
+            chat_handler._is_image_chunk(chunk_type) or chat_handler._is_audio_chunk(chunk_type)
+            for (_start, _end, _chunk_ptr, chunk_type, _media_id) in chunk_spans
+        )
+        if has_media:
+            # Keeps the C resources alive — `_mtmd_prefill` processes each chunk (text
+            # via DecodeGate, media via encode_lock) and frees them at the end.
+            mtmd_chunk_spans = chunk_spans
+            mtmd_chunks = chunks
+            mtmd_bitmap_cleanup = bitmap_cleanup
+        else:
+            # No real media in this message — nothing to hold on to, free immediately
+            # (same cleanup the handler's own __call__ does in its finally block).
+            if chunks is not None:
+                chat_handler._mtmd_cpp.mtmd_input_chunks_free(chunks)
+            if bitmap_cleanup:
+                for bitmap in bitmap_cleanup:
+                    chat_handler._mtmd_cpp.mtmd_bitmap_free(bitmap)
         prompt_tokens = full_prompt_ids
     else:
         result = formatter(
@@ -488,6 +410,10 @@ def _prepare_session(llm, messages: List[Dict[str, Any]], **kwargs) -> Optional[
         grammar_str=grammar_str,
         post_handler=post_handler,
         messages_norm=messages_norm,
+        mtmd_handler=chat_handler if mtmd_chunk_spans is not None else None,
+        mtmd_chunk_spans=mtmd_chunk_spans,
+        mtmd_chunks=mtmd_chunks,
+        mtmd_bitmap_cleanup=mtmd_bitmap_cleanup,
     )
 
 
@@ -533,24 +459,123 @@ def _build_sampling_params(model, kwargs: dict, grammar_str: str):
     )
 
 
-async def _generate_via_gate(model, gate: DecodeGate, seq_id: int, prepared: PreparedGeneration, kwargs: dict):
+async def _mtmd_prefill(model, seq_id: int, prepared: PreparedGeneration) -> Tuple[int, int]:
     """
-    Núcleo comum de geração via `DecodeGate`: reaproveita o KV cache já existente pra
-    essa conversa (`model._reuse_prefix_and_eval`), monta um `LlamaSamplingContext` por
-    sessão (grammar/reasoning-budget/dry/mirostat/etc. inclusos), e faz um generator
-    Python simples (não-async) que a cada `next()` submete o próximo passo ao gate e
-    devolve o token amostrado — junto com o texto incremental e o motivo de parada.
+    Processes the prefill of a message with real media, chunk by chunk — text goes to
+    `model.decode_gate` normally (batchable with other sessions, and already keeps
+    `input_ids`/`n_tokens` up to date on its own), image/audio is encoded via
+    `chat_handler.encode_chunk_exclusive()` (a SEPARATE lock, owned by the
+    `MTMDChatHandler` itself, only protecting `mtmd_encode_chunk`/`mtmd_ctx`), and only
+    the final injection into the KV cache uses `decode_gate`. This lets OTHER sessions
+    keep decoding text while an image is being encoded — only the short step of
+    injecting the already-ready result into the KV cache needs exclusivity.
 
-    Yields (new_text: bytes, finish_reason: Optional[str]) — o chamador decide o que
-    fazer com cada pedaço (emitir incrementalmente, ou acumular até o fim).
+    Mirrors `MTMDChatHandler.__call__` (llama_multimodal.py:1044-1189), including prefix
+    reuse across turns of the same conversation (doesn't re-encode an image that's
+    already in the KV cache from a previous turn).
+
+    Returns (idx, pos): the logits index to sample the first response token from, and
+    the current KV cache position (to continue steady-state generation).
+    """
+    from llama_cpp.llama import active_seq_id
+    from llama_cpp import llama_cpp as llama_cpp_lib
+    import ctypes
+
+    chat_handler = prepared.mtmd_handler
+    chunk_spans = prepared.mtmd_chunk_spans
+    chunks = prepared.mtmd_chunks
+    bitmap_cleanup = prepared.mtmd_bitmap_cleanup
+    gate = model.decode_gate
+
+    active_seq_id.set(seq_id)
+    try:
+        # Prefix reuse across turns: compares the "virtual ledger" (a mix of real
+        # tokens and negative media IDs) against what's already in this session's KV
+        # cache — same logic as `MTMDChatHandler.__call__` (lines 1066-1097).
+        current_history = model.input_ids[:model.n_tokens].tolist()
+        longest_prefix = model.longest_token_prefix(current_history, prepared.prompt_tokens, model.verbose)
+        if longest_prefix < model.n_tokens:
+            model._ctx.memory_seq_rm(seq_id, longest_prefix, -1)
+            model.n_tokens = longest_prefix
+
+        n_past = model.n_tokens
+        last_idx = -1
+
+        for start_idx, end_idx, chunk_ptr, chunk_type, media_id in chunk_spans:
+            if end_idx <= n_past:
+                continue  # already reused from this conversation's prefix
+
+            if chat_handler._is_text_chunk(chunk_type):
+                unprocessed_start = max(start_idx, n_past) - start_idx
+                n_tokens_out = ctypes.c_size_t()
+                tokens_ptr = chat_handler._mtmd_cpp.mtmd_input_chunk_get_tokens_text(chunk_ptr, ctypes.byref(n_tokens_out))
+                if tokens_ptr and n_tokens_out.value > 0:
+                    all_tokens = [tokens_ptr[j] for j in range(n_tokens_out.value)]
+                    tokens_to_eval = all_tokens[unprocessed_start:]
+                    if tokens_to_eval:
+                        last_idx = await gate.submit_tokens(seq_id, tokens_to_eval, n_past)
+                        active_seq_id.set(seq_id)
+                        n_past += len(tokens_to_eval)
+
+            else:  # image or audio
+                # 1. Encode — only contends for the handler's own encode_lock, NOT
+                #    decode_gate. Other sessions keep decoding text freely while this
+                #    runs.
+                embd = await chat_handler.encode_chunk_exclusive(chunk_ptr)
+
+                # 2. Injects the already-ready result into the KV cache — this part
+                #    does need decode_gate (calls llama_decode under the hood).
+                # ctypes requires a properly-typed CFUNCTYPE instance for the callback
+                # parameter — a bare `None` isn't accepted when the declared type is
+                # CFUNCTYPE; it needs an explicitly-typed NULL function pointer.
+                null_callback = ctypes.cast(None, chat_handler._mtmd_cpp.mtmd_helper_post_decode_callback)
+
+                def _decode_media(_n_past=n_past, _chunk_ptr=chunk_ptr, _embd=embd):
+                    new_n_past = llama_cpp_lib.llama_pos(0)
+                    result = chat_handler._mtmd_cpp.mtmd_helper_decode_image_chunk(
+                        chat_handler.mtmd_ctx, model._ctx.ctx, _chunk_ptr, _embd,
+                        llama_cpp_lib.llama_pos(_n_past), llama_cpp_lib.llama_seq_id(seq_id),
+                        model.n_batch, ctypes.byref(new_n_past), null_callback, None,
+                    )
+                    if result != 0:
+                        raise RuntimeError(f"mtmd_helper_decode_image_chunk falhou (code {result})")
+                    return new_n_past.value
+
+                new_n_past = await gate.run_exclusive(_decode_media)
+                active_seq_id.set(seq_id)
+                model.input_ids[n_past:new_n_past] = media_id
+                n_past = new_n_past
+                model.n_tokens = n_past
+
+        return last_idx, n_past
+    finally:
+        if chunks is not None:
+            chat_handler._mtmd_cpp.mtmd_input_chunks_free(chunks)
+        if bitmap_cleanup:
+            for bitmap in bitmap_cleanup:
+                chat_handler._mtmd_cpp.mtmd_bitmap_free(bitmap)
+
+
+async def _generate_via_gate(model, seq_id: int, prepared: PreparedGeneration, kwargs: dict):
+    """
+    Common generation core via `model.decode_gate` (the fork's queue+leader mechanism,
+    real batching across sessions — see `DecodeGate`/`Llama.decode_gate` in llama.py):
+    reuses the KV cache already existing for this conversation
+    (`model._reuse_prefix_and_eval`, or `_mtmd_prefill` for messages with real media),
+    builds a `LlamaSamplingContext` per session (grammar/reasoning-budget/dry/mirostat/
+    etc. included), and drives a plain (non-async) Python generator that on each
+    `next()` submits the next step to the gate and returns the sampled token — along
+    with the incremental text and the stop reason.
+
+    Yields (new_text: bytes, finish_reason: Optional[str]) — the caller decides what to
+    do with each piece (emit it incrementally, or accumulate until the end).
     """
     from llama_cpp.llama import active_seq_id, StopStringMatcher
     from llama_cpp._internals import LlamaSamplingContext
     from llama_cpp import llama_cpp as llama_cpp_lib
 
     active_seq_id.set(seq_id)
-    delta_tokens = model._reuse_prefix_and_eval(prepared.prompt_tokens, seq_id=seq_id, reset=True)
-    pos = model.n_tokens
+    gate = model.decode_gate
 
     sampling_params = _build_sampling_params(model, kwargs, prepared.grammar_str)
     sampling_ctx = LlamaSamplingContext(sampling_params, model._model)
@@ -560,9 +585,21 @@ async def _generate_via_gate(model, gate: DecodeGate, seq_id: int, prepared: Pre
     if not max_tokens or max_tokens <= 0:
         max_tokens = model._n_ctx - len(prepared.prompt_tokens)
 
-    req = DecodeRequest(seq_id=seq_id, tokens=delta_tokens, pos=pos)
-    idx = await gate.submit(req)
-    pos += len(delta_tokens)
+    if prepared.mtmd_chunk_spans is not None:
+        # Message with real media: prefill chunk by chunk (text batchable in
+        # decode_gate, media via chat_handler.encode_chunk_exclusive()) — see
+        # `_mtmd_prefill`. The ledger (input_ids/n_tokens) already comes out updated
+        # from there, no need to repeat it here.
+        idx, pos = await _mtmd_prefill(model, seq_id, prepared)
+    else:
+        delta_tokens = model._reuse_prefix_and_eval(prepared.prompt_tokens, seq_id=seq_id, reset=True)
+        pos = model.n_tokens
+
+        # `submit_tokens` already keeps input_ids/n_tokens up to date on its own (part
+        # of decode_gate itself, in the fork) — no need to repeat that bookkeeping here.
+        idx = await gate.submit_tokens(seq_id, delta_tokens, pos)
+        active_seq_id.set(seq_id)
+        pos += len(delta_tokens)
 
     active_seq_id.set(seq_id)
     token = sampling_ctx.sample(model._ctx, idx=idx)
@@ -605,11 +642,10 @@ async def _generate_via_gate(model, gate: DecodeGate, seq_id: int, prepared: Pre
             finish_reason = "length"
             break
 
-        req = DecodeRequest(seq_id=seq_id, tokens=[token], pos=pos)
-        idx = await gate.submit(req)
+        idx = await gate.submit_tokens(seq_id, [token], pos)
+        active_seq_id.set(seq_id)
         pos += 1
 
-        active_seq_id.set(seq_id)
         token = sampling_ctx.sample(model._ctx, idx=idx)
         sampling_ctx.accept(token, has_grammar)
 
@@ -631,35 +667,36 @@ def _chat_chunk(response_id: str, created: int, model_name: str, delta: Optional
     }
 
 
-async def _run_batched_generation_stream(model, gate, seq_id, prepared, kwargs, response_id, created, model_name):
-    """Streaming incremental de verdade via `DecodeGate` — só usado quando NÃO há
-    `post_handler` (formato nomeado ou jinja genérico, sem parsing extra de tool_call no
-    final), onde cada pedaço de texto pode ser entregue assim que é gerado."""
+async def _run_batched_generation_stream(model, seq_id, prepared, kwargs, response_id, created, model_name):
+    """Real incremental streaming via `model.decode_gate` — only used when there's NO
+    `post_handler` (named format or generic jinja, no extra tool_call parsing at the
+    end), where each piece of text can be delivered as soon as it's generated."""
     yield _chat_chunk(response_id, created, model_name, delta={"role": "assistant"})
-    async for new_text, finish_reason in _generate_via_gate(model, gate, seq_id, prepared, kwargs):
+    async for new_text, finish_reason in _generate_via_gate(model, seq_id, prepared, kwargs):
         if new_text:
             yield _chat_chunk(response_id, created, model_name, delta={"content": new_text.decode("utf-8", errors="ignore")})
         if finish_reason is not None:
             yield _chat_chunk(response_id, created, model_name, finish_reason=finish_reason)
 
 
-async def _run_batched_generation_then_parse(model, gate, seq_id, prepared, kwargs, response_id, created, model_name):
+async def _run_batched_generation_then_parse(model, seq_id, prepared, kwargs, response_id, created, model_name):
     """
-    Usado quando HÁ `post_handler` (Qwen/Phi/MTMD sem mídia) — esses handlers fazem
-    parsing de tool_call/reasoning via regex sobre o TEXTO COMPLETO, e seus
-    `_stream_response` originais consomem um generator SÍNCRONO (o que `create_completion
-    (stream=True)` produz) — incompatível com o generator assíncrono do `DecodeGate`.
-    Em vez de reimplementar o parsing de cada handler de forma assíncrona (risco real de
-    divergir sutilmente do comportamento hoje em produção), rodamos a geração batchada
-    até o fim (o ganho de throughput do `DecodeGate` continua valendo — é a geração de
-    token a token que fica rápida), montamos a resposta completa no formato que
-    `_parse_response` já espera, chamamos ele (síncrono, sem generator), e só então
-    fatiamos o resultado corrigido em chunks pro cliente. Streaming real (token a token
-    visível pro cliente) fica só pros formatos sem `post_handler` nesta primeira versão.
+    Used when there IS a `post_handler` (Qwen/Phi/MTMD without media) — these handlers
+    parse tool_call/reasoning via regex over the FULL TEXT, and their original
+    `_stream_response` consume a SYNCHRONOUS generator (what `create_completion
+    (stream=True)` produces) — incompatible with `decode_gate`'s async generator.
+    Instead of reimplementing each handler's parsing asynchronously (a real risk of
+    subtly diverging from today's production behavior), we run the batched generation
+    to completion (the throughput gain from `decode_gate` still applies — it's the
+    token-by-token generation that gets fast), assemble the full response in the format
+    `_parse_response` already expects, call it (synchronously, no generator), and only
+    then slice the corrected result into chunks for the client. Real streaming
+    (token-by-token visible to the client) is only for formats without `post_handler`
+    in this first version.
     """
     full_text = b""
     finish_reason = "length"
-    async for new_text, fr in _generate_via_gate(model, gate, seq_id, prepared, kwargs):
+    async for new_text, fr in _generate_via_gate(model, seq_id, prepared, kwargs):
         full_text += new_text
         if fr is not None:
             finish_reason = fr
@@ -680,7 +717,7 @@ async def _run_batched_generation_then_parse(model, gate, seq_id, prepared, kwar
     try:
         response = prepared.post_handler._parse_response(response)
     except TypeError:
-        pass  # handler com assinatura inesperada — segue com a resposta crua
+        pass  # handler with an unexpected signature — proceed with the raw response
 
     message = response["choices"][0].get("message", {})
     final_finish_reason = response["choices"][0].get("finish_reason", finish_reason)
@@ -698,14 +735,14 @@ async def _run_batched_generation_then_parse(model, gate, seq_id, prepared, kwar
     yield _chat_chunk(response_id, created, model_name, finish_reason=final_finish_reason)
 
 
-async def _fallback_stream(model, gate: DecodeGate, create_kwargs: dict):
+async def _fallback_stream(model, create_kwargs: dict):
     """
-    Caminho de segurança: reaproveita `create_chat_completion()` inteiro, um passo
-    (`next()`) por vez — mesma mecânica do dispatcher round-robin antigo — mas cada passo
-    adquire a MESMA exclusão mútua do `DecodeGate`, garantindo que nunca corra ao mesmo
-    tempo que uma rodada batchada (ou outro fallback) de outra sessão. Usado quando
-    `_prepare_session` devolve `None` (mensagem com mídia de verdade, ou handler
-    desconhecido que não sabemos decompor com segurança).
+    Safety path: reuses `create_chat_completion()` in full, one step (`next()`) at a
+    time — same mechanics as the old round-robin dispatcher — but each step acquires
+    the SAME mutual exclusion as `model.decode_gate`, guaranteeing it never runs at the
+    same time as a batched round (or another fallback) from a different session. Used
+    when `_prepare_session` returns `None` (an unknown handler we can't safely
+    decompose).
     """
     from llama_cpp.llama import active_seq_id
 
@@ -719,7 +756,7 @@ async def _fallback_stream(model, gate: DecodeGate, create_kwargs: dict):
         return next(state["gen"], _SENTINEL)
 
     while True:
-        chunk = await gate.run_exclusive_step(_step)
+        chunk = await model.decode_gate.run_exclusive(_step)
         if chunk is _SENTINEL:
             break
         yield chunk
@@ -739,7 +776,10 @@ class GGUF:
         self.model_path = hf_hub_download(repo_id=model["model_id"], filename=model["filename"])
         self.model_metadata = ModelMetadata(self.model_path)
         self.allocator: Optional[SeqAllocator] = None
-        self.gate: Optional[DecodeGate] = None
+        # The decode gate (queue+leader, real batching) lives in the fork itself —
+        # `self.model.decode_gate`, created by `Llama.__init__` — no need for its own
+        # reference here. The image/audio encode lock also lives in the fork, on
+        # `chat_handler.encode_lock` (`MTMDChatHandler.__init__`) — same logic.
         self.instances = []
         self.n_seq_max = int(model.get("n_seq_max") or model.get("n_parallel") or 1)
         self.offload_kqv = model.get("offload_kqv") if model.get("offload_kqv") is not None else True
@@ -753,7 +793,7 @@ class GGUF:
     def decrement_layers(self) -> bool:
         curr_layers = self.meta.get("num_layers")
 
-        # Se for -1, resolvemos o total antes de decrementar
+        # If it's -1, resolve the total before decrementing
         if curr_layers == -1:
             curr_layers = self.max_layers()
 
@@ -775,11 +815,11 @@ class GGUF:
         headers = payload.get("headers", {})
         n_ctx_per_req = int(headers.get("x-context-window") or payload.get("n_ctx") or meta.get("context_window") or 4096)
 
-        # O contexto real na GPU é multiplicado pelo número de slots paralelos
+        # The real context on GPU is multiplied by the number of parallel slots
         effective_n_ctx = n_ctx_per_req * self.n_seq_max
 
         # 2. Get layers config
-        # Estima a VRAM necessária usando o calculador de recursos unificado
+        # Estimates the required VRAM using the unified resource calculator
         estimate = await estimate_vram_ram(
             model_path=self.model_path,
             context_window=n_ctx_per_req,
@@ -800,11 +840,11 @@ class GGUF:
 
         meta = self.meta
 
-        # Aumentamos o padrão para 4096 para suportar agentes mais complexos
+        # Raised the default to 4096 to support more complex agents
         n_ctx_per_req = n_ctx or int(meta.get("context_window") or os.environ.get("LLM_CTX_TOKENS", '4096'))
         effective_n_ctx = n_ctx_per_req * self.n_seq_max
 
-        # Serialização de carregamento do mesmo arquivo de modelo
+        # Serializes loading of the same model file
         lock = get_gguf_load_lock(self.model_path)
         with lock:
             if self.backend == 'cpu':
@@ -880,7 +920,7 @@ class GGUF:
                     else:
                         logger.info("GGUF: Using default FP16 for KV Cache")
 
-                # Extração de Capacidades
+                # Capability extraction
                 model_identifier = meta["model_id"] + meta["filename"]
                 caps = detect_model_capabilities(model_identifier)
 
@@ -895,7 +935,7 @@ class GGUF:
                 # ==========================================
                 logger.info(f"GGUF: Loading single multi-sequence instance on {self.backend} (n_ctx={effective_n_ctx}, n_seq_max={self.n_seq_max})...")
 
-                # Cada seq_id precisa do seu próprio Chat Handler (estado independente)
+                # Each seq_id needs its own Chat Handler (independent state)
                 # Qwen Tool Calling & Reasoning Support (non-VL)
                 if 'qwen' in model_identifier.lower() and meta.get("model_type") != "vision":
                     from .chat_handlers import QwenChatHandler
@@ -960,7 +1000,8 @@ class GGUF:
 
                 self.model = Llama(**base_params)
                 self.allocator = SeqAllocator(self.n_seq_max)
-                self.gate = DecodeGate(self.model)
+                # self.model.decode_gate and (if MTMD) chat_handler.encode_lock already
+                # come ready from the fork's own __init__.
 
             except Exception as e:
                 logger.error(f"GGUF: Failed to load {self.meta['model_alias']}: {e}")
@@ -990,8 +1031,8 @@ class GGUF:
         kwargs.pop("reasoning_enabled", None)
         kwargs.pop("reasoning_effort", None)
 
-        # FIX: Se response_format for json_object, repeat_penalty DEVE ser 1.0
-        # Caso contrário o llama.cpp penaliza os caracteres da gramática JSON e entra em loop de espaços
+        # FIX: If response_format is json_object, repeat_penalty MUST be 1.0
+        # Otherwise llama.cpp penalizes the JSON grammar characters and loops on whitespace
         fmt = kwargs.get("response_format")
         if isinstance(fmt, dict) and fmt.get("type") == "json_object":
             kwargs["repeat_penalty"] = 1.0
@@ -1004,18 +1045,19 @@ class GGUF:
         if "max_tokens" not in kwargs:
             kwargs["max_tokens"] = -1
 
-        # O Truque do Force Reasoning: A IA começa já pensando
+        # The Force Reasoning trick: the AI starts out already thinking
         if force_reasoning:
             messages.append({"role": "assistant", "content": "<think>\n"})
 
-        # Adquire um seq_id do alocador — usa conversation_id (x-session-id) para affinity de KV cache
+        # Acquires a seq_id from the allocator — uses conversation_id (x-session-id) for KV cache affinity
         seq_id, is_new_conversation = await self.allocator.acquire(conversation_id=conversation_id)
 
         try:
-            # Só resetamos o KV cache quando essa seq_id está trocando de dono (conversa
-            # diferente da que ela guardava). Se é a mesma conversa retomando (ou uma
-            # chamada re-entrante da mesma request), NÃO resetamos — deixamos o próprio
-            # generate() reaproveitar o prefixo do KV cache automaticamente.
+            # We only reset the KV cache when this seq_id is changing owners (a
+            # different conversation than the one it held). If it's the same
+            # conversation resuming (or a re-entrant call from the same request), we do
+            # NOT reset — we let generate() itself reuse the KV cache prefix
+            # automatically.
             if is_new_conversation:
                 try:
                     from llama_cpp.llama import active_seq_id
@@ -1035,12 +1077,15 @@ class GGUF:
             create_kwargs["stream"] = True
             create_kwargs["seq_id"] = seq_id
 
-            # Resolve se essa request pode ir pelo caminho batchado (DecodeGate — 1
-            # decode() por rodada cobrindo múltiplas sessões) ou precisa do caminho de
-            # fallback (create_chat_completion() inteiro, sob a MESMA exclusão mútua do
-            # gate) — mensagem com mídia de verdade, ou handler que não sabemos decompor
-            # com segurança. `force_round_robin` no preset do modelo força o fallback
-            # incondicionalmente (escape-hatch, sem precisar de deploy de código).
+            # Resolves whether this request can take the batched path (model.decode_gate,
+            # in the fork — 1 decode() per round covering multiple sessions; messages
+            # with real media also go through here, via `_mtmd_prefill` — text
+            # batchable, image/audio encoded via `chat_handler.encode_chunk_exclusive()`,
+            # separate from decode_gate) or needs the fallback path
+            # (create_chat_completion() in full, under the SAME mutual exclusion as
+            # decode_gate) — only for a custom handler we can't safely decompose.
+            # `force_round_robin` in the model preset forces the fallback
+            # unconditionally (escape hatch, no code deploy needed).
             prepared = None
             if not self.meta.get("force_round_robin"):
                 prepared = _prepare_session(self.model, messages, **kwargs)
@@ -1050,20 +1095,20 @@ class GGUF:
             model_alias = self.meta.get("model_alias", "unknown")
 
             if prepared is None:
-                raw_chunks_gen = _fallback_stream(self.model, self.gate, create_kwargs)
+                raw_chunks_gen = _fallback_stream(self.model, create_kwargs)
             elif prepared.post_handler is None:
                 raw_chunks_gen = _run_batched_generation_stream(
-                    self.model, self.gate, seq_id, prepared, kwargs,
+                    self.model, seq_id, prepared, kwargs,
                     response_id, created_ts, model_alias,
                 )
             else:
                 raw_chunks_gen = _run_batched_generation_then_parse(
-                    self.model, self.gate, seq_id, prepared, kwargs,
+                    self.model, seq_id, prepared, kwargs,
                     response_id, created_ts, model_alias,
                 )
 
             async def _raw_chunks():
-                """Consome os chunks da geração (batchada ou fallback) um a um."""
+                """Consumes the generation chunks (batched or fallback) one at a time."""
                 async for chunk in raw_chunks_gen:
                     yield chunk
 
@@ -1093,7 +1138,7 @@ class GGUF:
                                 "total_tokens": (prompt_tokens + completion_tokens)
                             })
 
-                            # Se recebemos um STOP e ainda há buffer, enviamos antes do chunk de stop
+                            # If we received a STOP and there's still buffer, send it before the stop chunk
                             if buffer:
                                 target_key = 'content' if not tag_opened else 'reasoning_content'
                                 chunk_flush = copy.deepcopy(chunk)
@@ -1105,14 +1150,14 @@ class GGUF:
                             yield chunk
                             continue
 
-                        # Pass-through para outros dados que não sejam texto puro
+                        # Pass-through for data that isn't plain text
                         if "audio_url" in delta or "image_url" in delta or "tool_calls" in delta:
                             yield chunk
                             continue
 
                         content = delta.get("content", "")
                         if not content:
-                            # Apenas manter vivos chunks que tenham estrutura vazia ou sem texto
+                            # Just keep alive chunks that have an empty structure or no text
                             if not finish_reason and not delta:
                                 yield chunk
                             continue
@@ -1148,8 +1193,8 @@ class GGUF:
                             if not processed:
                                 break
 
-                        # Retém apenas os últimos 20 caracteres no buffer para garantir que não vamos
-                        # quebrar uma tag no meio. Envia todo o resto.
+                        # Keep only the last 20 characters in the buffer to make sure we
+                        # don't break a tag in the middle. Send everything else.
                         if len(buffer) > 20:
                             safe_yield = buffer[:-20]
                             buffer = buffer[-20:]
@@ -1159,7 +1204,7 @@ class GGUF:
                                 chunk_out["choices"][0]["delta"] = {target_key: safe_yield}
                                 yield chunk_out
 
-                    # Flush residual do buffer se sobrar algo
+                    # Flush any leftover buffer residue
                     if buffer and chunk is not None:
                         target_key = 'content' if not tag_opened else 'reasoning_content'
                         chunk_out = copy.deepcopy(chunk)
@@ -1183,11 +1228,12 @@ class GGUF:
             if stream:
                 return stream_adapter()
 
-            # MODO NÃO-STREAM: consome o mesmo stream_adapter() (já separa content/
-            # reasoning_content/tool_calls) e monta a resposta completa no final —
-            # a geração em si roda exatamente do mesmo jeito (intercalada com outras
-            # sequências ativas no dispatcher); só muda se o cliente vê os chunks
-            # conforme saem, ou só recebe a resposta pronta no fim.
+            # NON-STREAM MODE: consumes the same stream_adapter() (already separates
+            # content/reasoning_content/tool_calls) and assembles the full response at
+            # the end — generation itself runs exactly the same way (interleaved with
+            # other sessions active in the dispatcher); the only difference is whether
+            # the client sees the chunks as they come out, or only gets the finished
+            # response at the end.
             content_parts: List[str] = []
             reasoning_parts: List[str] = []
             tool_calls_acc: List[dict] = []
@@ -1252,8 +1298,9 @@ class GGUF:
                 "usage": final_usage,
             }
         except Exception:
-            # Se falhamos antes mesmo de submeter a sessão ao dispatcher (ou o próprio
-            # stream_adapter() já não vai rodar seu finally), garante que a seq não fica presa.
+            # If we failed even before submitting the session to the dispatcher (or
+            # stream_adapter() itself won't run its finally), make sure the seq doesn't
+            # stay stuck.
             self.allocator.release(seq_id)
             raise
 
@@ -1268,9 +1315,8 @@ class GGUF:
         except Exception as e:
             logger.debug(f"GGUF: Non-critical error clearing context vars: {e}")
 
-        # DecodeGate não tem task de fundo nem estado persistente além da fila (vazia
-        # entre requests) e do lock — basta soltar a referência.
-        self.gate = None
+        # decode_gate and (if MTMD) chat_handler.encode_lock live on `self.model` itself
+        # (fork) — they die together with it below, no cleanup needed here on our own.
 
         if self.allocator:
             try:
@@ -1287,7 +1333,7 @@ class GGUF:
                 except Exception as e:
                     logger.warning(f"GGUF: Error calling close() on model: {e}")
 
-            # Deletar explicitamente chama o destrutor (__del__) no C++
+            # Explicitly deleting calls the destructor (__del__) in C++
             del self.model
             self.model = None
 

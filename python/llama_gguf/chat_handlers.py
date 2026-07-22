@@ -24,16 +24,16 @@ logger = logging.getLogger(__name__)
 
 def _flatten_and_normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Achata `content` em lista (comum quando o payload vem multimodal) pra uma string,
-    quando a mensagem NÃO tem imagem — modelos de visão precisam do formato de lista, os
-    demais quebram o template Jinja se receberem uma lista. Também desserializa
-    `tool_calls[].function.arguments` de string JSON pra dict, porque os templates Jinja
-    usam `tojson`/acesso a campo, não uma string já serializada.
+    Flattens `content` from a list (common when the payload comes in multimodal) into a
+    string, when the message does NOT have an image — vision models need the list
+    format, everything else breaks the Jinja template if it receives a list. Also
+    deserializes `tool_calls[].function.arguments` from a JSON string into a dict,
+    because Jinja templates use `tojson`/field access, not an already-serialized string.
 
-    Não muta os dicts originais do caller — devolve uma lista nova. Extraído de 4
-    implementações quase idênticas (`Gemma4Handler`/`QwenChatHandler`/`Qwen35Handler`,
-    que mutavam `messages` in-place, e `PhiChatHandler`, que já copiava certo — este helper
-    segue o padrão do Phi).
+    Does not mutate the caller's original dicts — returns a new list. Extracted from 4
+    nearly-identical implementations (`Gemma4Handler`/`QwenChatHandler`/`Qwen35Handler`,
+    which mutated `messages` in-place, and `PhiChatHandler`, which already copied
+    correctly — this helper follows Phi's pattern).
     """
     processed = []
     for msg in messages:
@@ -76,7 +76,7 @@ def _flatten_and_normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict
 
 class Gemma4Handler(Gemma4ChatHandler):
     def __call__(self, **kwargs):
-        # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
+        # Ensures tool_call arguments are dicts for the Jinja template
         messages = _flatten_and_normalize_messages(kwargs.get("messages", []))
         kwargs = dict(kwargs)
         kwargs["messages"] = messages
@@ -266,8 +266,8 @@ class Gemma4Handler(Gemma4ChatHandler):
 
 class QwenChatHandler(LlamaChatCompletionHandler):
     """
-    Handler para modelos Qwen (2.5+) que suporta Tool Calling via tags <|tool_call|>
-    e pensamento via <|thought|>.
+    Handler for Qwen models (2.5+) that supports Tool Calling via <|tool_call|> tags
+    and thinking via <|thought|>.
     """
     def __init__(self, template: str, eos_token: str, bos_token: str):
         self.formatter = Jinja2ChatFormatter(
@@ -278,12 +278,12 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         self.handler = self.formatter.to_chat_handler()
 
     def __call__(self, **kwargs):
-        # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
+        # Ensures tool_call arguments are dicts for the Jinja template
         messages = _flatten_and_normalize_messages(kwargs.get("messages", []))
         kwargs = dict(kwargs)
         kwargs["messages"] = messages
 
-        # O handler interno do Jinja2ChatFormatter faz o trabalho pesado de renderização
+        # The internal Jinja2ChatFormatter handler does the heavy lifting of rendering
         response = self.handler(**kwargs)
 
         if kwargs.get("stream"):
@@ -298,7 +298,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         if not isinstance(content, str):
             return response
 
-        # 1. Extração de Pensamento: <|thought|>, <think> ou <thought>
+        # 1. Thinking extraction: <|thought|>, <think>, or <thought>
         thinking_pattern = re.compile(r'<(?:\|thought\||think|thought)>([\s\S]+?)(?:</(?:think|thought)>|(?=<\|)|$)', re.DOTALL)
         think_match = thinking_pattern.search(content)
         reasoning = None
@@ -307,14 +307,14 @@ class QwenChatHandler(LlamaChatCompletionHandler):
             reasoning = think_match.group(1).strip()
             content = content.replace(think_match.group(0), "")
 
-        # 2. Extração de Tool Calls: <|tool_call|> ou <tool_call>
+        # 2. Tool call extraction: <|tool_call|> or <tool_call>
         tool_call_pattern = re.compile(r'<(?:\|tool_call\||tool_call)>([\s\S]+?)(?:</tool_call>|(?=<\|)|$)', re.DOTALL)
         parsed_tools = []
 
         for tc_match in tool_call_pattern.finditer(content):
             raw_json = tc_match.group(1).strip()
             try:
-                # Qwen geralmente entrega um JSON direto ou lista de JSONs
+                # Qwen usually delivers a direct JSON or a list of JSONs
                 data = json.loads(raw_json)
                 calls = data if isinstance(data, list) else [data]
                 
@@ -331,16 +331,16 @@ class QwenChatHandler(LlamaChatCompletionHandler):
             except Exception as e:
                 logger.warning(f"QwenChatHandler: Falha ao parsear JSON de tool_call: {e}")
 
-        # Limpa o conteúdo de tags
+        # Strips tags from the content
         content = tool_call_pattern.sub('', content)
         content = content.replace('<|im_start|>assistant', '').replace('<|im_end|>', '')
         content = content.strip() or None
 
-        # 3. Fallback: modelo gerou a tool como tag XML direta, ex: <filesystem__list_directory>{"path":"/"}</filesystem__list_directory>
-        # Isso ocorre em modelos menores (Qwen3.5-4B) que misturam o formato XML com o formato padrão
+        # 3. Fallback: model generated the tool as a raw XML tag, e.g. <filesystem__list_directory>{"path":"/"}</filesystem__list_directory>
+        # This happens on smaller models (Qwen3.5-4B) that mix the XML format with the standard one
         if not parsed_tools and content:
-            # Corresponde a: <nome_tool>args_json</nome_tool> ou <nome_tool> (sem args)
-            # nome_tool: letras, dígitos, _ e __ (padrão MCP filesystem__list_directory)
+            # Matches: <tool_name>args_json</tool_name> or <tool_name> (no args)
+            # tool_name: letters, digits, _ and __ (MCP standard, e.g. filesystem__list_directory)
             fallback_pattern = re.compile(
                 r'<([a-zA-Z][a-zA-Z0-9_]*)(?:>([\s\S]*?)</\1>|(?:\s*/>|\s*$))',
                 re.DOTALL
@@ -381,7 +381,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
         called_tools = False
         first_chunk = True
 
-        # Detecção de pensamento pré-semeado (prompt prefill)
+        # Detection of pre-seeded thinking (prompt prefill)
         is_preseeded_think = False
         if messages:
             last_msg = messages[-1]
@@ -409,7 +409,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
 
             buffer += content
 
-            # Detecção de início de tags (Pensamento)
+            # Detection of tag starts (Thinking)
             thought_start = None
             for ts in ['<|thought|>', '<think>', '<thought>']:
                 if ts in buffer:
@@ -423,13 +423,13 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                     delta["content"] = before
                     yield chunk
                 
-                # Inicia bloco de pensamento
+                # Starts the thinking block
                 delta["content"] = "<think>"
                 yield chunk
                 buffer = after
                 continue
 
-            # Detecção de início de tags (Tool Call)
+            # Detection of tag starts (Tool Call)
             tool_start = None
             for ts in ['<|tool_call|>', '<tool_call>']:
                 if ts in buffer:
@@ -441,7 +441,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                 called_tools = True
                 before, after = buffer.split(tool_start, 1)
                 
-                # Se estávamos em pensamento, fechamos antes de abrir tool_call
+                # If we were inside thinking, close it before opening tool_call
                 if before.strip() and current_tag == 'thought':
                     delta["content"] = "</think>"
                     yield chunk
@@ -452,7 +452,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                 buffer = after
                 continue
 
-            # Limpeza preventiva
+            # Preventive cleanup
             delta.pop("content", None)
             delta.pop("reasoning_content", None)
             delta.pop("tool_calls", None)
@@ -467,11 +467,11 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                 if thought_end:
                     content_inside, rest = buffer.split(thought_end, 1)
                     if content_inside.strip():
-                        # O GGUF.stream_adapter espera <think>...</think> para converter em reasoning_content
+                        # GGUF.stream_adapter expects <think>...</think> to convert into reasoning_content
                         delta["content"] = content_inside
                         yield chunk
-                    
-                    # Fecha a tag explicitamente para o GGUF.stream_adapter detectar
+
+                    # Explicitly closes the tag so GGUF.stream_adapter can detect it
                     delta["content"] = "</think>"
                     yield chunk
 
@@ -479,14 +479,14 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                     current_tag = None
                     continue
                 
-                # Enquanto está em pensamento, encaminha como conteúdo normal. 
-                # O GGUF.stream_adapter cuidará de converter para reasoning_content se estiver entre <think>
+                # While inside thinking, forward it as normal content.
+                # GGUF.stream_adapter will take care of converting it to reasoning_content if it's between <think>
                 delta["content"] = buffer
                 yield chunk
                 buffer = ""
                 continue
 
-            # Se estamos em tool_call, bufferizamos até o fim
+            # If we're inside tool_call, buffer until the end
             if current_tag == 'tool_call':
                 tool_end = None
                 for te in ['</tool_call>', '<|im_end|>', '<|']:
@@ -502,33 +502,33 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                         calls = data if isinstance(data, list) else [data]
                         for call in calls:
                             uid = uuid.uuid4().hex[:10]
-                            # Emite o cabeçalho
+                            # Emits the header
                             chunk_head = json.loads(json.dumps(chunk))
                             chunk_head["choices"][0]["delta"]["tool_calls"] = [{
                                 "index": 0, "id": f"call_{uid}", "type": "function", "function": {"name": call.get("name")}
                             }]
                             yield chunk_head
-                            # Emite os argumentos
+                            # Emits the arguments
                             chunk_args = json.loads(json.dumps(chunk))
                             chunk_args["choices"][0]["delta"]["tool_calls"] = [{
                                 "index": 0, "id": f"call_{uid}", "function": {"arguments": json.dumps(call.get("arguments", {}))}
                             }]
                             yield chunk_args
                     except:
-                        # Fallback se falhar o JSON
+                        # Fallback if the JSON fails to parse
                         delta["content"] = raw_json
                         yield chunk
-                    
+
                     buffer = rest
                     current_tag = None
                     continue
-                
-                # Enquanto captura a tool, não emite nada
+
+                # While capturing the tool, don't emit anything
                 continue
 
-            # Fallback: Se não há tag ativa, verifica se inicia uma
+            # Fallback: if there's no active tag, check whether one is starting
             if not current_tag:
-                # Se detectarmos início de pensamento, emitimos a tag de abertura
+                # If we detect the start of thinking, emit the opening tag
                 for ts in ['<|thought|>', '<think>', '<thought>']:
                     if ts in buffer:
                         before, after = buffer.split(ts, 1)
@@ -544,7 +544,7 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                 
                 if current_tag: continue
 
-                # Se detectarmos início de tool call
+                # If we detect the start of a tool call
                 for ts in ['<|tool_call|>', '<tool_call>']:
                     if ts in buffer:
                         before, after = buffer.split(ts, 1)
@@ -558,15 +558,15 @@ class QwenChatHandler(LlamaChatCompletionHandler):
                 
                 if current_tag: continue
 
-            # Se não há tag ativa, envia normal
+            # If there's no active tag, send it as-is
             delta["content"] = buffer
             yield chunk
             buffer = ""
 
         # Finish reason fix
         if called_tools:
-             # O último chunk deve ter o finish_reason correto
-             pass 
+             # The last chunk must have the correct finish_reason
+             pass
 
     def _build_stream_tool_call(self, idx, name=None, args=None):
         tool_call = {"index": 0, "id": f"call_{idx}"}
@@ -586,8 +586,8 @@ class Qwen35Handler(Qwen35ChatHandler):
         super().__init__(**kwargs)
 
     def __call__(self, **kwargs):
-        # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
-        # (Alguns templates como o do Qwen 3.5 usam | items e quebram se for string JSON)
+        # Ensures tool_call arguments are dicts for the Jinja template
+        # (Some templates, like Qwen 3.5's, use | items and break if it's a JSON string)
         messages = _flatten_and_normalize_messages(kwargs.get("messages", []))
         kwargs = dict(kwargs)
         kwargs["messages"] = messages
@@ -606,8 +606,8 @@ class Qwen35Handler(Qwen35ChatHandler):
         if not isinstance(content, str):
             return response
 
-        # Extração de Tool Calls (Formato Qwen 3.5 XML-like)
-        # Ex: <tool_call> <function=search_web> <parameter=query>... </parameter> </function> </tool_call>
+        # Tool call extraction (Qwen 3.5 XML-like format)
+        # E.g.: <tool_call> <function=search_web> <parameter=query>... </parameter> </function> </tool_call>
         tool_call_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
         function_pattern = re.compile(r'<function=(.*?)>(.*?)</function>', re.DOTALL)
         parameter_pattern = re.compile(r'<parameter=(.*?)>(.*?)</parameter>', re.DOTALL)
@@ -623,7 +623,7 @@ class Qwen35Handler(Qwen35ChatHandler):
                     p_name = param_match.group(1).strip()
                     p_val = param_match.group(2).strip()
                     
-                    # Conversão básica de tipos
+                    # Basic type conversion
                     if p_val.lower() == "true": p_val = True
                     elif p_val.lower() == "false": p_val = False
                     elif p_val.isdigit(): p_val = int(p_val)
@@ -642,7 +642,7 @@ class Qwen35Handler(Qwen35ChatHandler):
                     }
                 })
 
-        # Extração de Thinking Block
+        # Thinking block extraction
         thinking_pattern = re.compile(r'<(?:\|thought\||think|thought|\|channel>thought)>([\s\S]+?)(?:</(?:think|thought)>|<channel\|>|(?=<\|)|$)', re.DOTALL)
         think_match = thinking_pattern.search(content)
         if think_match:
@@ -650,7 +650,7 @@ class Qwen35Handler(Qwen35ChatHandler):
             message["reasoning_content"] = thinking
             content = content.replace(think_match.group(0), "").strip()
 
-        # Remove as tags de tool call do conteúdo, mas preserva o resto
+        # Removes the tool call tags from the content, but keeps the rest
         content = tool_call_pattern.sub('', content).strip() or None
         
         message["content"] = content
@@ -666,7 +666,7 @@ class Qwen35Handler(Qwen35ChatHandler):
         called_tools = False
         last_usage = None
 
-        # Estado para parsing de tools em stream
+        # State for parsing tools during streaming
         uid = None
         current_tool_name = None
         current_param_name = None
@@ -676,24 +676,24 @@ class Qwen35Handler(Qwen35ChatHandler):
             delta = chunk.get("choices", [{}])[0].get("delta", {})
             content = delta.get("content", "")
 
-            # Captura usage de qualquer chunk para repassar no chunk final
+            # Captures usage from any chunk to pass along in the final chunk
             if chunk.get("usage"):
                 last_usage = chunk["usage"]
 
             if not content:
-                # Suprime chunks sem conteúdo (finish_reason stop/null, usage) após tool calls
+                # Suppresses content-less chunks (finish_reason stop/null, usage) after tool calls
                 if called_tools:
                     continue
                 yield chunk
                 continue
 
-            # Suprime conteúdo residual (ex: '\n\n') que o modelo emite após fechar </tool_call>
+            # Suppresses residual content (e.g. '\n\n') the model emits after closing </tool_call>
             if called_tools and not current_tag:
                 continue
 
             buffer += content
 
-            # Detecção de Início de Tool Call
+            # Detection of a Tool Call start
             if not current_tag:
                 if '<tool_call>' in buffer:
                     current_tag = 'tool_call'
@@ -704,9 +704,9 @@ class Qwen35Handler(Qwen35ChatHandler):
                         chunk_copy["choices"][0]["delta"]["content"] = before
                         yield chunk_copy
                     buffer = after
-                    # Não retornamos continue aqui para processar o 'after' imediatamente
-                
-                # Se não entrou em tag de tool_call, verifica se pode emitir parte do buffer
+                    # We don't return continue here so 'after' gets processed immediately
+
+                # If we didn't enter a tool_call tag, check whether part of the buffer can be emitted
                 if not current_tag:
                     while buffer:
                         idx = buffer.find('<')
@@ -717,16 +717,16 @@ class Qwen35Handler(Qwen35ChatHandler):
                             buffer = buffer[idx:]
                         elif idx == 0:
                             if "<tool_call>".startswith(buffer):
-                                # Prefixo de tool_call (pode ser incompleto), para o while e espera próximo chunk
+                                # tool_call prefix (may be incomplete), stop the while and wait for the next chunk
                                 break
                             else:
-                                # Não é prefixo, emite o '<' e continua o while
+                                # Not a prefix, emit the '<' and keep looping
                                 chunk_copy = json.loads(json.dumps(chunk))
                                 chunk_copy["choices"][0]["delta"]["content"] = "<"
                                 yield chunk_copy
                                 buffer = buffer[1:]
                         else:
-                            # Não tem '<' no buffer
+                            # No '<' in the buffer
                             chunk_copy = json.loads(json.dumps(chunk))
                             chunk_copy["choices"][0]["delta"]["content"] = buffer
                             yield chunk_copy
@@ -734,11 +734,11 @@ class Qwen35Handler(Qwen35ChatHandler):
                             break
                     continue
 
-            # Processamento de Tool Call Ativa
+            # Active Tool Call processing
             if current_tag == 'tool_call':
-                # Fim da tool call
+                # End of the tool call
                 if '</tool_call>' in buffer:
-                    # Se uma função ainda estava aberta, fecha-a
+                    # If a function was still open, close it
                     if current_tool_name:
                         chunk_end = json.loads(json.dumps(chunk))
                         chunk_end["choices"][0]["delta"].pop("content", None)
@@ -754,15 +754,15 @@ class Qwen35Handler(Qwen35ChatHandler):
                     current_tag = None
                     continue
 
-                # Início da função: <function=name>
+                # Function start: <function=name>
                 if not current_tool_name:
                     fn_match = re.search(r'<function=(.*?)>', buffer)
                     if fn_match:
                         current_tool_name = fn_match.group(1).strip().replace('"', '').replace("'", "")
                         uid = uuid.uuid4().hex[:10]
                         first_param = True
-                        
-                        # 1. Emite o início da tool call
+
+                        # 1. Emits the start of the tool call
                         chunk_head = json.loads(json.dumps(chunk))
                         chunk_head["choices"][0]["delta"].pop("content", None)
                         chunk_head["choices"][0]["delta"].pop("reasoning_content", None)
@@ -771,7 +771,7 @@ class Qwen35Handler(Qwen35ChatHandler):
                         }]
                         yield chunk_head
 
-                        # 2. Inicia o JSON dos argumentos
+                        # 2. Starts the arguments JSON
                         chunk_start_args = json.loads(json.dumps(chunk))
                         chunk_start_args["choices"][0]["delta"].pop("content", None)
                         chunk_start_args["choices"][0]["delta"].pop("reasoning_content", None)
@@ -783,7 +783,7 @@ class Qwen35Handler(Qwen35ChatHandler):
                         buffer = buffer.split(fn_match.group(0), 1)[1]
                         continue
                 
-                # Fim da função: </function>
+                # Function end: </function>
                 if current_tool_name and '</function>' in buffer:
                     chunk_end = json.loads(json.dumps(chunk))
                     chunk_end["choices"][0]["delta"].pop("content", None)
@@ -798,23 +798,23 @@ class Qwen35Handler(Qwen35ChatHandler):
                     buffer = rest
                     continue
 
-                # Processamento de Parâmetros dentro da função ativa
+                # Processing parameters inside the active function
                 if current_tool_name:
-                    # Se não estamos capturando um parâmetro, busca o próximo <parameter=name>
+                    # If we're not currently capturing a parameter, look for the next <parameter=name>
                     if not current_param_name:
                         param_start_match = re.search(r'<parameter=(.*?)>', buffer)
                         if param_start_match:
                             current_param_name = param_start_match.group(1).strip().replace('"', '').replace("'", "")
                             buffer = buffer.split(param_start_match.group(0), 1)[1]
-                            # Continua para processar o valor se estiver no buffer
-                    
-                    # Se estamos capturando um parâmetro, busca o fim </parameter>
+                            # Fall through to process the value if it's already in the buffer
+
+                    # If we're capturing a parameter, look for the closing </parameter>
                     if current_param_name:
                         if '</parameter>' in buffer:
                             val, rest = buffer.split('</parameter>', 1)
                             val = val.strip()
-                            
-                            # Conversão de tipos
+
+                            # Type conversion
                             v_lower = val.lower()
                             if v_lower == "true": val_parsed = True
                             elif v_lower == "false": val_parsed = False
@@ -841,10 +841,10 @@ class Qwen35Handler(Qwen35ChatHandler):
                             current_param_name = None
                             continue
                 
-                # Enquanto estamos dentro de <tool_call>, nunca emitimos conteúdo para o usuário
-                # Se o buffer crescer demais sem tags, algo está errado, mas mantemos o buffer
+                # While we're inside <tool_call>, we never emit content to the user
+                # If the buffer grows too much without tags, something is wrong, but we keep buffering
                 if len(buffer) > 1000 and '<' not in buffer:
-                    # Fallback preventivo: se parecer texto perdido, limpa
+                    # Preventive fallback: if it looks like stray text, clear it
                     buffer = ""
                 continue
 
@@ -871,7 +871,7 @@ class Qwen35Handler(Qwen35ChatHandler):
 
 
 _PHI4_CHAT_TEMPLATE = (
-    # System block (com tools opcionais embutidas)
+    # System block (with optional embedded tools)
     "{%- if messages[0]['role'] == 'system' -%}"
         "<|system|>{{ messages[0]['content'] or '' }}"
         "{%- if 'tools' in messages[0] and messages[0]['tools'] is not none -%}"
@@ -884,7 +884,7 @@ _PHI4_CHAT_TEMPLATE = (
     # Turns
     "{%- for message in messages -%}"
         "{%- if message['role'] == 'system' -%}"
-        # Assistant: reconstrói reasoning + tool_call se existirem
+        # Assistant: reconstructs reasoning + tool_call if present
         "{%- elif message['role'] == 'assistant' -%}"
             "{%- set content = message['content'] or '' -%}"
             "{%- set reasoning_content = '' -%}"
@@ -913,7 +913,7 @@ _PHI4_CHAT_TEMPLATE = (
         # Tool response: <|tool_response|>...<|end|>
         "{%- elif message['role'] == 'tool' -%}"
             "<|tool_response|>{{ message['content'] or '' }}<|end|>"
-        # User e demais roles
+        # User and other roles
         "{%- else -%}"
             "<|{{ message['role'] }}|>{{ message['content'] or '' }}<|end|>"
         "{%- endif -%}"
@@ -924,16 +924,16 @@ _PHI4_CHAT_TEMPLATE = (
 
 class PhiChatHandler(LlamaChatCompletionHandler):
     """
-    Handler para Phi-4-mini-instruct com suporte a Tool Calling via
+    Handler for Phi-4-mini-instruct with Tool Calling support via
     <|tool_call|>[{"name": "...", "arguments": {...}}]<|/tool_call|>.
 
-    Tokens especiais:
+    Special tokens:
       <|system|>...<|end|>            — system message
-      <|tool|>...<|/tool|>            — definição de tools (dentro do system)
-      <|user|>...<|end|>              — turno do usuário
-      <|assistant|>...<|end|>         — turno do assistente
-      <|tool_call|>...<|/tool_call|>  — chamada de tool gerada pelo modelo
-      <|tool_response|>...<|end|>     — resultado da tool
+      <|tool|>...<|/tool|>            — tool definitions (inside the system message)
+      <|user|>...<|end|>              — user turn
+      <|assistant|>...<|end|>         — assistant turn
+      <|tool_call|>...<|/tool_call|>  — tool call generated by the model
+      <|tool_response|>...<|end|>     — tool result
     """
 
     TAG_OPEN  = "<|tool_call|>"
@@ -1031,7 +1031,7 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                 yield chunk
                 continue
 
-            # Suprime conteúdo residual após fechar a tool call
+            # Suppresses residual content after closing the tool call
             if called_tools and not current_tag:
                 continue
 
@@ -1049,7 +1049,7 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                     buffer = after
                     continue
 
-                # Emissão segura: segura prefixos de tag, emite o restante
+                # Safe emission: holds back tag prefixes, emits the rest
                 while buffer:
                     idx = buffer.find("<")
                     if idx > 0:
@@ -1059,7 +1059,7 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                         buffer = buffer[idx:]
                     elif idx == 0:
                         if self.TAG_OPEN.startswith(buffer):
-                            break  # Possível início de tag, aguarda próximo chunk
+                            break  # Possible tag start, wait for the next chunk
                         else:
                             chunk_copy = json.loads(json.dumps(chunk))
                             chunk_copy["choices"][0]["delta"]["content"] = "<"
@@ -1073,7 +1073,7 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                         break
                 continue
 
-            # Dentro de tool_call: acumula até a tag de fechamento
+            # Inside tool_call: accumulate until the closing tag
             if current_tag == "tool_call":
                 if self.TAG_CLOSE in buffer:
                     raw_json, rest = buffer.split(self.TAG_CLOSE, 1)
@@ -1112,7 +1112,7 @@ class PhiChatHandler(LlamaChatCompletionHandler):
                     buffer = ""
                 continue
 
-        # Flush do buffer residual (conteúdo retido para detecção de tag)
+        # Flush the residual buffer (content held back for tag detection)
         if buffer and not called_tools and last_chunk is not None:
             chunk_copy = json.loads(json.dumps(last_chunk))
             chunk_copy["choices"][0]["delta"] = {"content": buffer}
