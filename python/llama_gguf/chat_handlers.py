@@ -22,33 +22,64 @@ from llama_cpp.llama_chat_format import (
 logger = logging.getLogger(__name__)
 
 
+def _flatten_and_normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Achata `content` em lista (comum quando o payload vem multimodal) pra uma string,
+    quando a mensagem NÃO tem imagem — modelos de visão precisam do formato de lista, os
+    demais quebram o template Jinja se receberem uma lista. Também desserializa
+    `tool_calls[].function.arguments` de string JSON pra dict, porque os templates Jinja
+    usam `tojson`/acesso a campo, não uma string já serializada.
+
+    Não muta os dicts originais do caller — devolve uma lista nova. Extraído de 4
+    implementações quase idênticas (`Gemma4Handler`/`QwenChatHandler`/`Qwen35Handler`,
+    que mutavam `messages` in-place, e `PhiChatHandler`, que já copiava certo — este helper
+    segue o padrão do Phi).
+    """
+    processed = []
+    for msg in messages:
+        msg = dict(msg)
+
+        content = msg.get("content")
+        if isinstance(content, list):
+            has_image = any(
+                isinstance(part, dict) and part.get("type") in ["image_url", "image"]
+                for part in content
+            )
+            if not has_image:
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                msg["content"] = "\n".join(text_parts)
+
+        if msg.get("tool_calls"):
+            new_tool_calls = []
+            for tc in msg["tool_calls"]:
+                tc = dict(tc)
+                f = tc.get("function")
+                if f and isinstance(f.get("arguments"), str):
+                    f = dict(f)
+                    try:
+                        f["arguments"] = json.loads(f["arguments"])
+                    except Exception:
+                        pass
+                    tc["function"] = f
+                new_tool_calls.append(tc)
+            msg["tool_calls"] = new_tool_calls
+
+        processed.append(msg)
+
+    return processed
+
+
 class Gemma4Handler(Gemma4ChatHandler):
     def __call__(self, **kwargs):
         # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
-        messages = kwargs.get("messages", [])
-        for message in messages:
-            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
-            content = message.get("content")
-            if isinstance(content, list):
-                # Only flatten if there are no images. Vision models need the list format.
-                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
-                if not has_image:
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                        elif isinstance(part, str):
-                            text_parts.append(part)
-                    message["content"] = "\n".join(text_parts)
-
-            if "tool_calls" in message and message["tool_calls"]:
-                for tool_call in message["tool_calls"]:
-                    f = tool_call.get("function")
-                    if f and isinstance(f.get("arguments"), str):
-                        try:
-                            f["arguments"] = json.loads(f["arguments"])
-                        except Exception:
-                            pass
+        messages = _flatten_and_normalize_messages(kwargs.get("messages", []))
+        kwargs = dict(kwargs)
+        kwargs["messages"] = messages
 
         response = super().__call__(**kwargs)
 
@@ -248,32 +279,10 @@ class QwenChatHandler(LlamaChatCompletionHandler):
 
     def __call__(self, **kwargs):
         # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
-        messages = kwargs.get("messages", [])
+        messages = _flatten_and_normalize_messages(kwargs.get("messages", []))
+        kwargs = dict(kwargs)
+        kwargs["messages"] = messages
 
-        for message in messages:
-            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
-            content = message.get("content")
-            if isinstance(content, list):
-                # Only flatten if there are no images. Vision models need the list format.
-                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
-                if not has_image:
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                        elif isinstance(part, str):
-                            text_parts.append(part)
-                    message["content"] = "\n".join(text_parts)
-
-            if "tool_calls" in message and message["tool_calls"]:
-                for tool_call in message["tool_calls"]:
-                    f = tool_call.get("function")
-                    if f and isinstance(f.get("arguments"), str):
-                        try:
-                            f["arguments"] = json.loads(f["arguments"])
-                        except Exception:
-                            pass
-        
         # O handler interno do Jinja2ChatFormatter faz o trabalho pesado de renderização
         response = self.handler(**kwargs)
 
@@ -579,31 +588,9 @@ class Qwen35Handler(Qwen35ChatHandler):
     def __call__(self, **kwargs):
         # Garante que os argumentos de tool_call sejam dicionários para o template Jinja
         # (Alguns templates como o do Qwen 3.5 usam | items e quebram se for string JSON)
-        messages = kwargs.get("messages", [])
-        for message in messages:
-            # Flatten content if it's a list (common for non-vision models receiving multimodal data)
-            content = message.get("content")
-            if isinstance(content, list):
-                # Only flatten if there are no images. Vision models need the list format.
-                has_image = any(isinstance(part, dict) and part.get("type") in ["image_url", "image"] for part in content)
-                if not has_image:
-                    text_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                        elif isinstance(part, str):
-                            text_parts.append(part)
-                    message["content"] = "\n".join(text_parts)
-
-
-            if "tool_calls" in message and message["tool_calls"]:
-                for tool_call in message["tool_calls"]:
-                    f = tool_call.get("function")
-                    if f and isinstance(f.get("arguments"), str):
-                        try:
-                            f["arguments"] = json.loads(f["arguments"])
-                        except Exception:
-                            pass
+        messages = _flatten_and_normalize_messages(kwargs.get("messages", []))
+        kwargs = dict(kwargs)
+        kwargs["messages"] = messages
 
         response = super().__call__(**kwargs)
 
@@ -961,43 +948,7 @@ class PhiChatHandler(LlamaChatCompletionHandler):
         self.handler = self.formatter.to_chat_handler()
 
     def __call__(self, **kwargs):
-        messages = kwargs.get("messages", [])
-        processed = []
-        for msg in messages:
-            msg = dict(msg)
-
-            content = msg.get("content")
-            if isinstance(content, list):
-                has_image = any(
-                    isinstance(p, dict) and p.get("type") in ["image_url", "image"]
-                    for p in content
-                )
-                if not has_image:
-                    msg["content"] = "\n".join(
-                        p.get("text", "") if isinstance(p, dict) and p.get("type") == "text"
-                        else str(p)
-                        for p in content
-                        if (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
-                    )
-
-            # Deep copy tool_calls para não mutar o payload original,
-            # e desserializa arguments string → dict para o template Jinja poder usar tojson
-            if msg.get("tool_calls"):
-                new_tcs = []
-                for tc in msg["tool_calls"]:
-                    tc = dict(tc)
-                    if "function" in tc:
-                        fn = dict(tc["function"])
-                        if isinstance(fn.get("arguments"), str):
-                            try:
-                                fn["arguments"] = json.loads(fn["arguments"])
-                            except Exception:
-                                pass
-                        tc["function"] = fn
-                    new_tcs.append(tc)
-                msg["tool_calls"] = new_tcs
-
-            processed.append(msg)
+        processed = _flatten_and_normalize_messages(kwargs.get("messages", []))
 
         tools = kwargs.get("tools")
         if tools:

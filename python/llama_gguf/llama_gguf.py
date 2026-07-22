@@ -7,6 +7,7 @@ import time
 import uuid
 import threading
 import copy
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from .resource_calculator import estimate_vram_ram, ModelMetadata
 from .context import request_id_var, acquired_instances_var
@@ -94,8 +95,8 @@ class SeqAllocator:
 
     NÃO faz nenhuma chamada nativa ao llama.cpp — é só bookkeeping de "qual seq_id está
     livre" e "qual conversation_id cada seq_id guarda atualmente". A exclusão mútua sobre
-    as chamadas nativas em si é garantida por outro mecanismo: o GGUFDispatcher é a ÚNICA
-    coroutine que chama a Llama compartilhada, então não existe mais nada aqui que precise
+    as chamadas nativas em si é garantida por outro mecanismo: o `DecodeGate` é o ÚNICO
+    ponto que chama a Llama compartilhada, então não existe mais nada aqui que precise
     de lock por slot.
     """
 
@@ -204,100 +205,104 @@ class SeqAllocator:
 _SENTINEL = object()
 
 
-class GenerationSession:
-    """Uma geração em andamento, servida pelo GGUFDispatcher."""
+@dataclass
+class DecodeRequest:
+    """Um pedido de decode: adicionar `tokens` ao KV cache do `seq_id`, a partir da
+    posição `pos`, e devolver o índice de logits do ÚLTIMO token (pra amostrar o próximo
+    token dessa sessão). Prefill (muitos tokens) e geração em regime estacionário (1
+    token) usam a MESMA classe — só varia o tamanho de `tokens`; é a mesma operação."""
+    seq_id: int
+    tokens: List[int]
+    pos: int
+    result_idx: int = -1
+    error: Optional[BaseException] = None
+    event: "asyncio.Event" = field(default_factory=asyncio.Event)
 
-    def __init__(self, seq_id: int, create_kwargs: dict):
-        self.seq_id = seq_id
-        self.create_kwargs = create_kwargs
-        self.gen = None  # generator vivo de create_chat_completion(stream=True), criado no 1º passo
-        self.done = False
-        self.error: Optional[BaseException] = None
-        self.queue: "asyncio.Queue" = asyncio.Queue()
 
-
-class GGUFDispatcher:
+class DecodeGate:
     """
-    Única coroutine que chama métodos de geração da instância `Llama` compartilhada.
+    Único ponto de exclusão mútua por instância `GGUF` sobre chamadas nativas de
+    `decode()`. Substitui o antigo `GGUFDispatcher` (round-robin, 1 `decode()` por sessão
+    por rodada) por fila + eleição de líder: quem chega e acha a fila livre vira líder,
+    drena TUDO que estiver esperando naquele instante (não só quem chegou primeiro),
+    monta um `LlamaBatch` com as contribuições de todos, decodifica UMA VEZ, distribui os
+    resultados, então recheca a fila antes de largar a liderança. Sem espera artificial —
+    o líder processa imediatamente quem já estiver esperando, seja 1 ou N pedidos.
 
-    Round-robin single-thread: a cada volta do loop, dá EXATAMENTE um passo (um `next()`
-    no generator de `create_chat_completion(stream=True, seq_id=...)`) para cada sessão
-    ativa, antes de passar pra próxima. Isso intercala N gerações de verdade — cada
-    cliente recebe tokens em paralelo, não em blocos — sem nunca ter duas chamadas
-    nativas ao llama.cpp simultâneas, porque só existe esta coroutine chamando o C.
+    Prefill e geração em regime estacionário passam pela MESMA fila/mecanismo — não são
+    dois caminhos diferentes. Isso evita por construção o bug (encontrado num protótipo
+    anterior) de reamostrar o último token do prompt numa posição nova pra "encaixar" num
+    modelo de rodada: aqui não existe rodada, só "submeta tokens, peça logits do último".
+
+    `run_exclusive_step()` adquire a MESMA exclusão mútua pra rodar uma função síncrona
+    arbitrária (usada pelo caminho de fallback — mensagens com mídia de verdade, ou
+    handlers que não sabemos decompor com segurança — que reaproveita
+    `create_chat_completion()` inteiro, um passo por vez, exatamente como o dispatcher
+    round-robin antigo fazia). Garante que essas chamadas NUNCA corram ao mesmo tempo que
+    uma rodada batchada de outra sessão — só existe UM lock por instância de modelo.
     """
 
     def __init__(self, model):
         self.model = model
-        self._sessions: Dict[int, GenerationSession] = {}
-        self._wakeup = asyncio.Event()
-        self._task: Optional[asyncio.Task] = None
+        self._pending: List[DecodeRequest] = []
+        self._lock = asyncio.Lock()
 
-    async def ensure_started(self):
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run())
+    async def submit(self, req: DecodeRequest) -> int:
+        self._pending.append(req)
+        async with self._lock:
+            # Pode ser que, enquanto esperávamos o lock, um líder anterior já tenha
+            # drenado a fila e processado este pedido — não reprocessar.
+            if not req.event.is_set():
+                await self._drain_and_decode()
+        if req.error is not None:
+            raise req.error
+        return req.result_idx
 
-    def stop(self):
-        if self._task is not None and not self._task.done():
-            try:
-                loop = asyncio.get_running_loop()
-                loop.call_soon_threadsafe(self._task.cancel)
-            except RuntimeError:
-                # Sem loop rodando nesta thread (ex.: unload chamado via to_thread) —
-                # melhor esforço, cancela direto.
-                self._task.cancel()
-        self._task = None
-        self._sessions.clear()
+    async def run_exclusive_step(self, fn):
+        """Roda `fn()` (síncrono, sem argumentos) com exclusividade total sobre o
+        modelo — nenhuma outra sessão (batchada ou não) decodifica enquanto isso."""
+        async with self._lock:
+            return fn()
 
-    def submit(self, session: GenerationSession):
-        self._sessions[session.seq_id] = session
-        self._wakeup.set()
+    async def _drain_and_decode(self):
+        if not self._pending:
+            return
+        batch_reqs, self._pending = self._pending, []
 
-    async def _run(self):
         from llama_cpp.llama import active_seq_id
 
-        while True:
-            active = [s for s in self._sessions.values() if not s.done]
-            if not active:
-                self._wakeup.clear()
-                await self._wakeup.wait()
-                continue
+        try:
+            batch = self.model._batch
+            batch.reset()
+            batch_pos = 0  # posição BRUTA no batch — get_logits_ith() espera a posição
+                            # real, não um contador compactado de quantos pedidos passaram
+            for r in batch_reqs:
+                active_seq_id.set(r.seq_id)
+                pos = r.pos
+                last_i = len(r.tokens) - 1
+                for i, tok in enumerate(r.tokens):
+                    is_last = (i == last_i)
+                    batch.add_token(tok, pos, [r.seq_id], is_last)
+                    pos += 1
+                    if is_last:
+                        r.result_idx = batch_pos
+                    batch_pos += 1
 
-            for session in active:
-                if session.done:
-                    continue
+            ret = self.model._ctx.decode(batch)
+            if ret != 0:
+                raise RuntimeError(f"llama_decode retornou {ret} (sem slot de KV cache disponível)")
+        except Exception as e:
+            for r in batch_reqs:
+                r.error = e
 
-                active_seq_id.set(session.seq_id)
-                try:
-                    if session.gen is None:
-                        session.gen = self.model.create_chat_completion(**session.create_kwargs)
-                    chunk = next(session.gen, _SENTINEL)
-                except StopIteration:
-                    chunk = _SENTINEL
-                except Exception as e:
-                    session.error = e
-                    session.done = True
-                    self._sessions.pop(session.seq_id, None)
-                    session.queue.put_nowait(None)
-                    continue
+        for r in batch_reqs:
+            r.event.set()
 
-                if chunk is _SENTINEL:
-                    session.done = True
-                    self._sessions.pop(session.seq_id, None)
-                    session.queue.put_nowait(None)
-                else:
-                    session.queue.put_nowait(chunk)
-                    finish_reason = chunk.get("choices", [{}])[0].get("finish_reason")
-                    if finish_reason is not None:
-                        session.done = True
-                        self._sessions.pop(session.seq_id, None)
-                        session.queue.put_nowait(None)
-
-            # Cede o controle pro event loop do asyncio entre voltas (não pro llama.cpp —
-            # só esta coroutine chama o C, nunca duas ao mesmo tempo). Isso deixa outras
-            # rotas do FastAPI (/health, outros modelos, etc.) responderem no meio das
-            # voltas do dispatcher.
-            await asyncio.sleep(0)
+        # Cede o controle pro event loop mesmo sem contenção no lock — um `asyncio.Lock`
+        # descontendido não suspende sozinho, então sem isso uma sessão gerando muitos
+        # tokens em sequência (sem nenhuma outra sessão concorrente) nunca devolveria o
+        # controle pro event loop, travando outras rotas do FastAPI até ela terminar.
+        await asyncio.sleep(0)
 
 
 def _accumulate_tool_call_deltas(acc: List[dict], delta_tool_calls: List[dict]):
@@ -319,6 +324,410 @@ def _accumulate_tool_call_deltas(acc: List[dict], delta_tool_calls: List[dict]):
             entry["function"]["arguments"] += fn["arguments"]
 
 
+_NAMED_FORMATTERS: Optional[Dict[str, Any]] = None
+
+
+def _get_named_formatter(chat_format: Optional[str]):
+    """Formatos nomeados (chatml/llama-2/llama-3/mistral-instruct/gemma) não ficam
+    guardados em nenhum registro público como `ChatFormatter` cru — só como handler já
+    empacotado (`LlamaChatCompletionHandlerRegistry`). As funções puras continuam
+    acessíveis diretamente pelo nome no módulo, então mapeamos manualmente aqui."""
+    global _NAMED_FORMATTERS
+    if _NAMED_FORMATTERS is None:
+        from llama_cpp import llama_chat_format
+        _NAMED_FORMATTERS = {
+            "chatml": llama_chat_format.format_chatml,
+            "llama-2": llama_chat_format.format_llama2,
+            "llama-3": llama_chat_format.format_llama3,
+            "mistral-instruct": llama_chat_format.format_mistral_instruct,
+            "gemma": llama_chat_format.format_gemma,
+        }
+    return _NAMED_FORMATTERS.get(chat_format) if chat_format else None
+
+
+@dataclass
+class PreparedGeneration:
+    """Resultado de `_prepare_session`: tudo que é necessário pra gerar via `DecodeGate`
+    sem precisar chamar `create_chat_completion()` (que geraria de forma não-batchável).
+    `post_handler`, quando presente, precisa ter seu `_parse_response(response)` chamado
+    no texto final montado (ver `_run_batched_generation_collect`), preservando o parsing
+    de tool_call/reasoning que os handlers Qwen/Phi/MTMD já fazem hoje."""
+    prompt_tokens: List[int]
+    stop: List[str]
+    stopping_criteria: Optional[Any]
+    grammar_str: str
+    post_handler: Optional[Any]
+    messages_norm: List[Dict[str, Any]]
+
+
+def _prepare_session(llm, messages: List[Dict[str, Any]], **kwargs) -> Optional[PreparedGeneration]:
+    """
+    Resolve o `ChatFormatter` certo pro handler/formato configurado em `llm` (a instância
+    `Llama`) e monta tudo que é necessário pra gerar via `DecodeGate` (tokens, stop,
+    stopping_criteria, grammar) — sem chamar geração nenhuma. Espelha a lógica de
+    `chat_formatter_to_chat_completion_handler` (que faz render+tokenize+grammar antes de
+    gerar de verdade), só que parando antes do `create_completion()`.
+
+    Recebe `**kwargs` (o payload da request, que inclui uma chave `model` com o ALIAS do
+    modelo, não a instância — daí o parâmetro se chamar `llm`, não `model`, evitando
+    colisão).
+
+    Devolve `None` se não souber decompor esse handler/mensagem com segurança — quem
+    chama deve cair no caminho de fallback (`DecodeGate.run_exclusive_step` +
+    `create_chat_completion()` inteiro, igual o dispatcher round-robin antigo fazia):
+    - mensagem com mídia de verdade endereçada a um handler MTMD (Gemma4/Qwen3.5-vision/
+      etc.) — o `__call__` desses handlers sempre muta o KV cache inline como parte do
+      preparo do prompt, não é separável;
+    - qualquer `chat_handler` customizado sem um jeito conhecido de extrair só o prompt
+      (não é Qwen/Phi nem MTMD);
+    - `chat_format` sem formatter resolvível (nem em `llm._chat_formatters`, nem um dos
+      formatos nomeados conhecidos) — o mesmo caso que já falharia hoje.
+    """
+    from llama_cpp.llama_chat_format import MTMDChatHandler
+
+    chat_handler = getattr(llm, "chat_handler", None)
+    formatter = None
+    post_handler = None
+    is_mtmd_no_media = False
+
+    if chat_handler is not None:
+        if isinstance(chat_handler, MTMDChatHandler):
+            media = chat_handler._get_media_items(messages)
+            if media:
+                return None  # mídia de verdade: precisa do __call__ completo (fallback)
+            is_mtmd_no_media = True
+            post_handler = chat_handler
+        elif callable(getattr(chat_handler, "formatter", None)):
+            # Convenção Qwen/PhiChatHandler: self.formatter é o ChatFormatter puro
+            formatter = chat_handler.formatter
+            post_handler = chat_handler
+        else:
+            return None  # handler customizado desconhecido: fallback
+    else:
+        chat_format = getattr(llm, "chat_format", None)
+        formatter = llm._chat_formatters.get(chat_format) or _get_named_formatter(chat_format)
+        if formatter is None:
+            return None
+
+    tools = kwargs.get("tools")
+    tool_choice = kwargs.get("tool_choice")
+    functions = kwargs.get("functions")
+    function_call = kwargs.get("function_call")
+    response_format = kwargs.get("response_format")
+    stop = kwargs.get("stop") or []
+    if isinstance(stop, str):
+        stop = [stop]
+    else:
+        stop = list(stop)
+
+    from .chat_handlers import _flatten_and_normalize_messages
+    messages_norm = _flatten_and_normalize_messages(messages)
+    stopping_criteria = None
+
+    if is_mtmd_no_media:
+        chat_handler._init_mtmd_context(llm)
+        full_prompt_ids, _spans, chunks, bitmap_cleanup = chat_handler._process_mtmd_prompt(
+            llama=llm,
+            messages=messages_norm,
+            functions=functions,
+            function_call=function_call,
+            tools=tools,
+            tool_choice=tool_choice,
+            add_generation_prompt=True,
+        )
+        # Sem mídia, não há nada pra reter — libera os recursos C imediatamente (mesma
+        # limpeza que o __call__ do handler faz no seu próprio bloco finally).
+        if chunks is not None:
+            chat_handler._mtmd_cpp.mtmd_input_chunks_free(chunks)
+        if bitmap_cleanup:
+            for bitmap in bitmap_cleanup:
+                chat_handler._mtmd_cpp.mtmd_bitmap_free(bitmap)
+        prompt_tokens = full_prompt_ids
+    else:
+        result = formatter(
+            messages=messages_norm,
+            functions=functions,
+            function_call=function_call,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        prompt_tokens = llm.tokenize(
+            result.prompt.encode("utf-8"),
+            add_bos=not result.added_special,
+            special=True,
+        )
+        if result.stop is not None:
+            rstop = result.stop if isinstance(result.stop, list) else [result.stop]
+            stop = stop + rstop
+        if result.stopping_criteria is not None:
+            stopping_criteria = result.stopping_criteria
+
+    grammar_str = ""
+    if response_format is not None and response_format.get("type") == "json_object":
+        from llama_cpp.llama_chat_format import _grammar_for_response_format
+        g = _grammar_for_response_format(response_format, verbose=llm.verbose)
+        if g is not None:
+            grammar_str = g._grammar
+
+    if tool_choice is not None and isinstance(tool_choice, dict) and tools is not None:
+        from llama_cpp import llama_grammar
+        name = tool_choice.get("function", {}).get("name")
+        tool = next((t for t in tools if t["function"]["name"] == name), None)
+        if tool is not None:
+            schema = tool["function"]["parameters"]
+            try:
+                g = llama_grammar.LlamaGrammar.from_json_schema(json.dumps(schema), verbose=llm.verbose)
+            except Exception:
+                g = llama_grammar.LlamaGrammar.from_string(llama_grammar.JSON_GBNF, verbose=llm.verbose)
+            grammar_str = g._grammar
+
+    return PreparedGeneration(
+        prompt_tokens=prompt_tokens,
+        stop=stop,
+        stopping_criteria=stopping_criteria,
+        grammar_str=grammar_str,
+        post_handler=post_handler,
+        messages_norm=messages_norm,
+    )
+
+
+def _build_sampling_params(model, kwargs: dict, grammar_str: str):
+    from llama_cpp._internals import LlamaSamplingParams
+    seed = kwargs.get("seed")
+    return LlamaSamplingParams(
+        top_k=kwargs.get("top_k", 40),
+        top_p=kwargs.get("top_p", 0.95),
+        min_p=kwargs.get("min_p", 0.05),
+        typical_p=kwargs.get("typical_p", 1.0),
+        temp=kwargs.get("temperature", 0.2),
+        top_n_sigma=kwargs.get("top_n_sigma", -1.0),
+        min_keep=kwargs.get("min_keep", 0),
+        dynatemp_range=kwargs.get("dynatemp_range", 0.0),
+        dynatemp_exponent=kwargs.get("dynatemp_exponent", 1.0),
+        penalty_last_n=kwargs.get("penalty_last_n", 64),
+        penalty_repeat=kwargs.get("repeat_penalty", 1.0),
+        penalty_freq=kwargs.get("frequency_penalty", 0.0),
+        penalty_present=kwargs.get("present_penalty", 0.0),
+        mirostat=kwargs.get("mirostat_mode", 0),
+        mirostat_tau=kwargs.get("mirostat_tau", 5.0),
+        mirostat_eta=kwargs.get("mirostat_eta", 0.1),
+        xtc_probability=kwargs.get("xtc_probability", 0.0),
+        xtc_threshold=kwargs.get("xtc_threshold", 0.1),
+        dry_multiplier=kwargs.get("dry_multiplier", 0.0),
+        dry_base=kwargs.get("dry_base", 1.75),
+        dry_allowed_length=kwargs.get("dry_allowed_length", 2),
+        dry_penalty_last_n=kwargs.get("dry_penalty_last_n", 0),
+        dry_sequence_breakers=kwargs.get("dry_seq_breakers", ["\n", ":", "\"", "*"]),
+        adaptive_target=kwargs.get("adaptive_target", -1.0),
+        adaptive_decay=kwargs.get("adaptive_decay", 0.9),
+        logit_bias=model._convert_logit_bias(kwargs.get("logit_bias")),
+        grammar=grammar_str,
+        grammar_lazy=kwargs.get("grammar_lazy", False),
+        seed=seed if seed is not None else model._seed,
+        reasoning_budget=kwargs.get("reasoning_budget", -1),
+        reasoning_start=kwargs.get("reasoning_start", "<think>"),
+        reasoning_end=kwargs.get("reasoning_end", "</think>"),
+        reasoning_budget_message=kwargs.get("reasoning_budget_message"),
+        reasoning_start_in_prompt=kwargs.get("reasoning_start_in_prompt", False),
+        reasoning_start_max_tokens=kwargs.get("reasoning_start_max_tokens", 32),
+    )
+
+
+async def _generate_via_gate(model, gate: DecodeGate, seq_id: int, prepared: PreparedGeneration, kwargs: dict):
+    """
+    Núcleo comum de geração via `DecodeGate`: reaproveita o KV cache já existente pra
+    essa conversa (`model._reuse_prefix_and_eval`), monta um `LlamaSamplingContext` por
+    sessão (grammar/reasoning-budget/dry/mirostat/etc. inclusos), e faz um generator
+    Python simples (não-async) que a cada `next()` submete o próximo passo ao gate e
+    devolve o token amostrado — junto com o texto incremental e o motivo de parada.
+
+    Yields (new_text: bytes, finish_reason: Optional[str]) — o chamador decide o que
+    fazer com cada pedaço (emitir incrementalmente, ou acumular até o fim).
+    """
+    from llama_cpp.llama import active_seq_id, StopStringMatcher
+    from llama_cpp._internals import LlamaSamplingContext
+    from llama_cpp import llama_cpp as llama_cpp_lib
+
+    active_seq_id.set(seq_id)
+    delta_tokens = model._reuse_prefix_and_eval(prepared.prompt_tokens, seq_id=seq_id, reset=True)
+    pos = model.n_tokens
+
+    sampling_params = _build_sampling_params(model, kwargs, prepared.grammar_str)
+    sampling_ctx = LlamaSamplingContext(sampling_params, model._model)
+    has_grammar = bool(prepared.grammar_str)
+
+    max_tokens = kwargs.get("max_tokens")
+    if not max_tokens or max_tokens <= 0:
+        max_tokens = model._n_ctx - len(prepared.prompt_tokens)
+
+    req = DecodeRequest(seq_id=seq_id, tokens=delta_tokens, pos=pos)
+    idx = await gate.submit(req)
+    pos += len(delta_tokens)
+
+    active_seq_id.set(seq_id)
+    token = sampling_ctx.sample(model._ctx, idx=idx)
+    sampling_ctx.accept(token, has_grammar)
+
+    completion_tokens: List[int] = []
+    stop_matcher = StopStringMatcher(model, prepared.prompt_tokens, prepared.stop)
+    emitted_len = 0
+    finish_reason = "length"
+
+    while True:
+        if llama_cpp_lib.llama_token_is_eog(model._model.vocab, token):
+            finish_reason = "stop"
+            break
+
+        completion_tokens.append(token)
+        suppress, stop_matched, text = stop_matcher.step(completion_tokens)
+
+        if not suppress:
+            if stop_matched is not None:
+                new_text = text[emitted_len:]
+                if new_text:
+                    yield new_text, None
+                finish_reason = "stop"
+                break
+
+            if prepared.stopping_criteria is not None:
+                import numpy as np
+                ids_arr = np.array(list(prepared.prompt_tokens) + completion_tokens, dtype=np.intc)
+                if prepared.stopping_criteria(ids_arr, np.empty(0, dtype=np.single)):
+                    finish_reason = "stop"
+                    break
+
+            new_text = text[emitted_len:]
+            emitted_len = len(text)
+            if new_text:
+                yield new_text, None
+
+        if len(completion_tokens) >= max_tokens:
+            finish_reason = "length"
+            break
+
+        req = DecodeRequest(seq_id=seq_id, tokens=[token], pos=pos)
+        idx = await gate.submit(req)
+        pos += 1
+
+        active_seq_id.set(seq_id)
+        token = sampling_ctx.sample(model._ctx, idx=idx)
+        sampling_ctx.accept(token, has_grammar)
+
+    yield b"", finish_reason
+
+
+def _chat_chunk(response_id: str, created: int, model_name: str, delta: Optional[dict] = None, finish_reason: Optional[str] = None) -> dict:
+    return {
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": delta or {},
+            "logprobs": None,
+            "finish_reason": finish_reason,
+        }],
+    }
+
+
+async def _run_batched_generation_stream(model, gate, seq_id, prepared, kwargs, response_id, created, model_name):
+    """Streaming incremental de verdade via `DecodeGate` — só usado quando NÃO há
+    `post_handler` (formato nomeado ou jinja genérico, sem parsing extra de tool_call no
+    final), onde cada pedaço de texto pode ser entregue assim que é gerado."""
+    yield _chat_chunk(response_id, created, model_name, delta={"role": "assistant"})
+    async for new_text, finish_reason in _generate_via_gate(model, gate, seq_id, prepared, kwargs):
+        if new_text:
+            yield _chat_chunk(response_id, created, model_name, delta={"content": new_text.decode("utf-8", errors="ignore")})
+        if finish_reason is not None:
+            yield _chat_chunk(response_id, created, model_name, finish_reason=finish_reason)
+
+
+async def _run_batched_generation_then_parse(model, gate, seq_id, prepared, kwargs, response_id, created, model_name):
+    """
+    Usado quando HÁ `post_handler` (Qwen/Phi/MTMD sem mídia) — esses handlers fazem
+    parsing de tool_call/reasoning via regex sobre o TEXTO COMPLETO, e seus
+    `_stream_response` originais consomem um generator SÍNCRONO (o que `create_completion
+    (stream=True)` produz) — incompatível com o generator assíncrono do `DecodeGate`.
+    Em vez de reimplementar o parsing de cada handler de forma assíncrona (risco real de
+    divergir sutilmente do comportamento hoje em produção), rodamos a geração batchada
+    até o fim (o ganho de throughput do `DecodeGate` continua valendo — é a geração de
+    token a token que fica rápida), montamos a resposta completa no formato que
+    `_parse_response` já espera, chamamos ele (síncrono, sem generator), e só então
+    fatiamos o resultado corrigido em chunks pro cliente. Streaming real (token a token
+    visível pro cliente) fica só pros formatos sem `post_handler` nesta primeira versão.
+    """
+    full_text = b""
+    finish_reason = "length"
+    async for new_text, fr in _generate_via_gate(model, gate, seq_id, prepared, kwargs):
+        full_text += new_text
+        if fr is not None:
+            finish_reason = fr
+
+    response = {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": full_text.decode("utf-8", errors="ignore")},
+            "finish_reason": finish_reason,
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+    try:
+        response = prepared.post_handler._parse_response(response)
+    except TypeError:
+        pass  # handler com assinatura inesperada — segue com a resposta crua
+
+    message = response["choices"][0].get("message", {})
+    final_finish_reason = response["choices"][0].get("finish_reason", finish_reason)
+
+    yield _chat_chunk(response_id, created, model_name, delta={"role": "assistant"})
+    if message.get("content"):
+        yield _chat_chunk(response_id, created, model_name, delta={"content": message["content"]})
+    if message.get("reasoning_content"):
+        yield _chat_chunk(response_id, created, model_name, delta={"reasoning_content": message["reasoning_content"]})
+    if message.get("tool_calls"):
+        tool_call_deltas = []
+        for i, tc in enumerate(message["tool_calls"]):
+            tool_call_deltas.append({**tc, "index": i})
+        yield _chat_chunk(response_id, created, model_name, delta={"tool_calls": tool_call_deltas})
+    yield _chat_chunk(response_id, created, model_name, finish_reason=final_finish_reason)
+
+
+async def _fallback_stream(model, gate: DecodeGate, create_kwargs: dict):
+    """
+    Caminho de segurança: reaproveita `create_chat_completion()` inteiro, um passo
+    (`next()`) por vez — mesma mecânica do dispatcher round-robin antigo — mas cada passo
+    adquire a MESMA exclusão mútua do `DecodeGate`, garantindo que nunca corra ao mesmo
+    tempo que uma rodada batchada (ou outro fallback) de outra sessão. Usado quando
+    `_prepare_session` devolve `None` (mensagem com mídia de verdade, ou handler
+    desconhecido que não sabemos decompor com segurança).
+    """
+    from llama_cpp.llama import active_seq_id
+
+    seq_id = create_kwargs.get("seq_id")
+    state: Dict[str, Any] = {}
+
+    def _step():
+        active_seq_id.set(seq_id)
+        if "gen" not in state:
+            state["gen"] = model.create_chat_completion(**create_kwargs)
+        return next(state["gen"], _SENTINEL)
+
+    while True:
+        chunk = await gate.run_exclusive_step(_step)
+        if chunk is _SENTINEL:
+            break
+        yield chunk
+        finish_reason = chunk.get("choices", [{}])[0].get("finish_reason")
+        if finish_reason is not None:
+            break
+
+
 class GGUF:
     def __init__(self, backend, model):
         from huggingface_hub import hf_hub_download
@@ -330,7 +739,7 @@ class GGUF:
         self.model_path = hf_hub_download(repo_id=model["model_id"], filename=model["filename"])
         self.model_metadata = ModelMetadata(self.model_path)
         self.allocator: Optional[SeqAllocator] = None
-        self.dispatcher: Optional[GGUFDispatcher] = None
+        self.gate: Optional[DecodeGate] = None
         self.instances = []
         self.n_seq_max = int(model.get("n_seq_max") or model.get("n_parallel") or 1)
         self.offload_kqv = model.get("offload_kqv") if model.get("offload_kqv") is not None else True
@@ -551,7 +960,7 @@ class GGUF:
 
                 self.model = Llama(**base_params)
                 self.allocator = SeqAllocator(self.n_seq_max)
-                self.dispatcher = GGUFDispatcher(self.model)
+                self.gate = DecodeGate(self.model)
 
             except Exception as e:
                 logger.error(f"GGUF: Failed to load {self.meta['model_alias']}: {e}")
@@ -573,7 +982,6 @@ class GGUF:
                 pass
 
         await asyncio.to_thread(self.load, n_ctx, kwargs.pop('num_layers', None))
-        await self.dispatcher.ensure_started()
 
         if "repetition_penalty" in kwargs:
             kwargs["repeat_penalty"] = kwargs.pop("repetition_penalty")
@@ -627,18 +1035,36 @@ class GGUF:
             create_kwargs["stream"] = True
             create_kwargs["seq_id"] = seq_id
 
-            session = GenerationSession(seq_id=seq_id, create_kwargs=create_kwargs)
-            self.dispatcher.submit(session)
+            # Resolve se essa request pode ir pelo caminho batchado (DecodeGate — 1
+            # decode() por rodada cobrindo múltiplas sessões) ou precisa do caminho de
+            # fallback (create_chat_completion() inteiro, sob a MESMA exclusão mútua do
+            # gate) — mensagem com mídia de verdade, ou handler que não sabemos decompor
+            # com segurança. `force_round_robin` no preset do modelo força o fallback
+            # incondicionalmente (escape-hatch, sem precisar de deploy de código).
+            prepared = None
+            if not self.meta.get("force_round_robin"):
+                prepared = _prepare_session(self.model, messages, **kwargs)
+
+            response_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created_ts = int(time.time())
+            model_alias = self.meta.get("model_alias", "unknown")
+
+            if prepared is None:
+                raw_chunks_gen = _fallback_stream(self.model, self.gate, create_kwargs)
+            elif prepared.post_handler is None:
+                raw_chunks_gen = _run_batched_generation_stream(
+                    self.model, self.gate, seq_id, prepared, kwargs,
+                    response_id, created_ts, model_alias,
+                )
+            else:
+                raw_chunks_gen = _run_batched_generation_then_parse(
+                    self.model, self.gate, seq_id, prepared, kwargs,
+                    response_id, created_ts, model_alias,
+                )
 
             async def _raw_chunks():
-                """Consome os chunks do dispatcher um a um — substitui o antigo
-                `await asyncio.to_thread(next, response, None)`."""
-                while True:
-                    chunk = await session.queue.get()
-                    if chunk is None:
-                        if session.error is not None:
-                            raise session.error
-                        break
+                """Consome os chunks da geração (batchada ou fallback) um a um."""
+                async for chunk in raw_chunks_gen:
                     yield chunk
 
             async def stream_adapter():
@@ -842,12 +1268,9 @@ class GGUF:
         except Exception as e:
             logger.debug(f"GGUF: Non-critical error clearing context vars: {e}")
 
-        if self.dispatcher:
-            try:
-                self.dispatcher.stop()
-            except Exception as e:
-                logger.warning(f"GGUF: Error stopping dispatcher: {e}")
-            self.dispatcher = None
+        # DecodeGate não tem task de fundo nem estado persistente além da fila (vazia
+        # entre requests) e do lock — basta soltar a referência.
+        self.gate = None
 
         if self.allocator:
             try:
